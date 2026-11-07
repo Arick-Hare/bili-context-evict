@@ -25,7 +25,9 @@ import { BodyTooLargeError, headerValue, readBody } from "../server.js";
 import { dismissHostPlugin, visibleHostPluginNotices } from "../host-plugin-notice.js";
 import { dismissedUpgradeNotices, dismissUpgradeNotice, PCK_NOTICE_ID, pckNoticeActive, WM_FASTPATH_INTRO_ID } from "../pck-notice.js";
 import { featureOverrideAbsent } from "../rollout.js";
-import { listSessions, memoryReport, peekSession, splitSessionWarnings, totalInFlight } from "../session.js";
+import { listSessions, memoryReport, peekSession, splitSessionWarnings, totalInFlight, getSession, markDirty } from "../session.js";
+import { maybeEvict, resolveEvictConfig, lastRequestSnapshot } from "../evict.js";
+import { readEvictionHistory, recordEviction } from "../evict-history.js";
 import { BILI_TUNNEL_HEADER } from "../tunnel-guard.js";
 import { isLoopbackAddress } from "../util.js";
 import { clearUpstreamAlertsForHost, getUpstreamAlerts, getUpstreamHealthReport } from "../upstream-alerts.js";
@@ -193,6 +195,95 @@ function auxProxyShot(opts: ProxyOptions): { proxy: string | null; source: strin
     }
 }
 
+/** 手动驱逐：POST /__bili/evict-now 的处理器。对 config.json `evict.sessions`
+ *  白名单里的每个会话，用「最近一次真实请求」的原始消息快照 + 压缩 state
+ *  执行一次 `maybeEvict`，真驱逐后写回 state/lastMessages 并 markDirty。
+ *  不依赖 round 循环——直接由 HTTP 请求驱动，作为自动触发失效时的手动后门。 */
+async function handleEvictNow(
+    res: http.ServerResponse,
+    core: CompressionCore,
+    config: Config,
+    log: (level: string, msg: string) => void,
+): Promise<void> {
+    const evict = resolveEvictConfig(loadConfigFile().evict, process.env);
+    const sessions = evict.sessions ?? [];
+    log("info", `[evict-manual] 手动驱逐：enabled=${evict.enabled} budget=${evict.budget} target=${evict.target} dryRun=${evict.dryRun} sessions=${JSON.stringify(sessions)}`);
+    const results: Array<Record<string, unknown>> = [];
+    // "*" = 当前进程内所有活跃会话（去掉 |sub: 派生 lane、去重）。不扫磁盘
+    // 会话目录，避免引入 web/index 的 -212 私有导出。
+    const allLive = sessions.includes("*");
+    const liveBases = [...new Set(listSessions().map((s) => s.id.split("|sub:")[0]))];
+    const targets = allLive
+        ? liveBases
+        : [...new Set(sessions.map((s) => s.split("|sub:")[0]))];
+    for (const base of targets) {
+        try {
+            const session = getSession(base);
+            const snapshot = lastRequestSnapshot(session);
+            const messages = snapshot?.messages ?? session.lastMessages ?? [];
+            const beforeTokens = snapshot ? snapshot.tokens : session.stats.contextTokens;
+            const tokensSource = snapshot ? "snapshot" as const : "stats" as const;
+            const snapshotAgeMs = snapshot?.at ? Date.now() - snapshot.at : null;
+            if (messages.length === 0) {
+                const note = "no lastMessages snapshot";
+                recordEviction({
+                    trigger: "manual", sessionId: base, evictedCount: 0, reclaimedTokens: 0,
+                    beforeRatio: null, afterRatio: null, dryRun: evict.dryRun, reason: note,
+                    tokensSource, snapshotAgeMs,
+                });
+                results.push({ id: base, evictedCount: 0, note });
+                continue;
+            }
+            const meta = session.metadata as unknown as Record<string, unknown> | undefined;
+            const metaLimit = meta?.["effectiveContextLimit"] ?? meta?.["reservedContextLimit"];
+            const sessionLimit = typeof metaLimit === "number" && metaLimit > 0 ? metaLimit : undefined;
+            const sessionConfig = sessionLimit ? { ...config, modelContextLimit: sessionLimit } : config;
+            const limit = sessionLimit ?? config.modelContextLimit;
+            const beforeRatio = limit > 0 ? beforeTokens / limit : null;
+            const trace: { reason?: string } = {};
+            const evicted = maybeEvict(
+                core, messages, session.state, sessionConfig, beforeTokens, evict,
+                (m) => log("info", `[evict-manual][${base}] ${m}`),
+                sessionLimit, trace, base,
+            );
+            if (evicted) {
+                session.state = evicted.state;
+                if (!(session as { lastMessagesFolded?: boolean }).lastMessagesFolded) session.lastMessages = evicted.messages;
+                markDirty(session);
+                const afterRatio = limit > 0 ? Math.max(0, beforeTokens - evicted.reclaimedTokens) / limit : null;
+                recordEviction({
+                    trigger: "manual", sessionId: base,
+                    evictedCount: evicted.evictedCount, reclaimedTokens: evicted.reclaimedTokens,
+                    beforeRatio, afterRatio, dryRun: evict.dryRun, reason: "",
+                    tokensSource, snapshotAgeMs,
+                });
+                results.push({
+                    id: base, evictedCount: evicted.evictedCount,
+                    reclaimedTokens: evicted.reclaimedTokens, beforeRatio, afterRatio,
+                });
+            } else {
+                const reason = trace.reason ?? "没有可驱逐的内容";
+                recordEviction({
+                    trigger: "manual", sessionId: base, evictedCount: 0, reclaimedTokens: 0,
+                    beforeRatio, afterRatio: beforeRatio, dryRun: evict.dryRun, reason,
+                    tokensSource, snapshotAgeMs,
+                });
+                results.push({ id: base, evictedCount: 0, beforeRatio, afterRatio: beforeRatio, note: reason });
+            }
+        } catch (e) {
+            const reason = String(e);
+            recordEviction({
+                trigger: "manual", sessionId: base, evictedCount: 0, reclaimedTokens: 0,
+                beforeRatio: null, afterRatio: null, dryRun: evict.dryRun, reason,
+                tokensSource: "unknown", snapshotAgeMs: null,
+            });
+            results.push({ id: base, error: reason });
+        }
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: true, results }));
+}
+
 export async function handleAdminRoute(req: http.IncomingMessage, res: http.ServerResponse, ctx: AdminCtx): Promise<void> {
     const { opts, core, config, log, instanceId, instanceStartedAt, proxyWatchers, initialWatcherPid, watcherLastSeen } = ctx;
     // SECURITY: the /__bili/ management endpoints (config read/write, reload,
@@ -251,6 +342,17 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         res.end(JSON.stringify(getUpstreamHealthReport()));
         return;
     }
+    // 驱逐记录：GET /__bili/evict-history?limit=20 → 最近 N 条，最新在前。
+    if (req.method === "GET" && (req.url ?? "").startsWith("/__bili/evict-history")) {
+        const q = new URL(req.url ?? "/__bili/evict-history", "http://localhost").searchParams;
+        const raw = Number(q.get("limit") ?? "20");
+        const limit = Number.isFinite(raw) && raw > 0 ? Math.min(100, Math.floor(raw)) : 20;
+        res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({ ok: true, entries: readEvictionHistory(limit) }));
+        return;
+    }
+    // 手动驱逐：POST /__bili/evict-now → 对白名单会话立即执行一次驱逐。
+    if (req.method === "POST" && req.url === "/__bili/evict-now") return handleEvictNow(res, core, config, log);
     if (req.method === "GET" && (req.url === "/__bili/sessions" || req.url?.startsWith("/__bili/sessions?"))) return sendWebSessions(res, req);
     if (req.method === "GET" && req.url?.startsWith("/__bili/logs")) return sendWebLogs(res, req);
     if (req.method === "GET" && req.url?.startsWith("/__bili/diagnostics")) return sendDiagnostics(res, req.url);

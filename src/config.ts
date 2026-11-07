@@ -1898,6 +1898,8 @@ type FileConfig = {
      *  re-signing instead of account-pool discovery (env BILI_CODEARTS_REF
      *  wins). */
     resign?: ResignSchemeMap;
+    /** 驱逐白名单原始配置（原样透传，由 src/evict.ts 自行解析）。 */
+    evict?: unknown;
     /** Set `false` to log real (non-public) target hosts instead of the
      *  `<private-host>` placeholder (#897; env BILI_LOG_MASK_HOSTS=0 wins). */
     maskHosts?: boolean;

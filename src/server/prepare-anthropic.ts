@@ -10,6 +10,7 @@ import { pluginAgentHeader } from "../plugin.js";
 import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, makeFoldPointReasoningDroppable, planReasoningDrop, reapOrphansLogged, runNudgeDecision, stripKernelSummaries, warnAnthropicThinkingPairs, type Prepared } from "../server.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
 import { excludeDeadRefRanges } from "../acp-status.js";
+import { autoEvictTurn, noteLastRequest } from "../evict.js";
 import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
 import { maybeSnapshotView } from "./snapshot-render.js";
 import { storedMessagesFor, storedRowLookupFor } from "../fold-decomposition-lookup.js";
@@ -392,8 +393,29 @@ export async function prepareAnthropic(
         // steers the model into an atomically-refused compress call.
         if (turn.nudge) turn.nudge.compressibleRanges = filterDeadRanges(session, excludeDeadRefRanges(viableRanges(turn.nudge.compressibleRanges), session.state.deadRefs));
         nudge = turn.nudge;
-        session.stats.contextTokens = tokenCount;
+        // 自动驱逐：DSH 的真实请求走这条 lane（loop/core.ts 的 ACP 回合循环
+        // 在这套部署里根本不跑）。驱逐成功时本轮不再发 nudge —— 可压缩范围
+        // 可能已经被整块折叠掉了。
+        const evictedTurn = autoEvictTurn(
+            core,
+            sessionId,
+            turn,
+            config,
+            tokenCount,
+            log,
+            typeof session.metadata.effectiveContextLimit === "number" ? session.metadata.effectiveContextLimit : undefined,
+        );
+        if (evictedTurn) {
+            session.state = evictedTurn.state;
+            nudge = undefined;
+            turn.nudge = undefined;
+        }
+        session.stats.contextTokens = evictedTurn
+            ? Math.max(0, tokenCount - evictedTurn.reclaimedTokens)
+            : tokenCount;
         session.stats.contextTokensSource = tokenCountSource;
+        // 给手动驱逐端点留一份「最近一次请求」的原始消息快照。
+        noteLastRequest(session, originalMessages, tokenCount);
         if (!session.meta.title || isAutoInjectedNotification(session.meta.title)) {
             const t = deriveTitle(msgs);
             if (t) session.meta.title = t;
