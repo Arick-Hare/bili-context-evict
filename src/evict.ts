@@ -703,6 +703,16 @@ export interface EvictOutcome {
 const isBadRef = (r: string | undefined): boolean =>
   r === undefined || r === "BLOCKED" || r.startsWith("BLOCKED");
 
+/**
+ * 把 `mNNNNN` 形式的 ref 解析成数值，用来和 sleep.json 的 boundary 比先后。
+ * 块自带 `startRef`/`endRef`（或 byRaw 反查）都是这个形式；`bN` 这类
+ * block ref 解析不出，保守跳过（补丁一 3.2 的兜底精神）。
+ */
+export function refNumber(ref: unknown): number | null {
+  const m = /^m(\d+)$/.exec(String(ref ?? "").trim());
+  return m ? Number(m[1]) : null;
+}
+
 /** 工具结果被丢后的占位符开头（用来判断「这条已经丢过」）。 */
 const DROPPED_MARK = "[tool output dropped: ";
 
@@ -723,20 +733,27 @@ export interface BlockUnit {
   endRef: string;
 }
 
-/** 新增候选来源（只加不删）：在 maybeEvict 的候选构造里调用一次。 */
+/**
+ * 新增候选来源（只加不删）：在 maybeEvict 的候选构造里调用一次。
+ *
+ * 补丁一（2026-11-08 02:11）修正：
+ *  - 去掉 `inView` 硬要求。块本身就是「原文已经不在视图里」的产物，让它回
+ *    messages 里定位自己是反的（实测短视图时 16 个 active 块全被刷掉）。
+ *  - 封盘线不再用消息下标 `maxIdx >= boundaryIndex`（块没有消息下标，且块尾
+ *    只要有一条越线就整块误杀），改成用块自己的 `endRef` 数值与 sleep.json
+ *    boundary 的 ref 数值比：`endRefNum < boundaryRefNum` 才算已封盘。
+ *  - `boundaryRefNum === null`（boundary 不是 mNNNNN / 定位失败）或块的
+ *    `endRef` 解析不出数值（如 `b1..b543` 这类 block ref）→ 保守跳过，
+ *    对应「boundary 指到最前时一块都不扔」的反向验收。
+ */
 export function collectBlockCandidates(
-  messages: CoreMessage[],
   state: CompressionState,
-  boundaryIndex: number,
+  boundaryRefNum: number | null,
   protectedIds: Set<string>,
   minSummaryChars: number,
 ): BlockUnit[] {
-  const indexByBase = new Map<string, number>();
-  for (let i = 0; i < messages.length; i++) {
-    const base = baseId(messages[i]!.id);
-    if (!indexByBase.has(base)) indexByBase.set(base, i);
-  }
   const units: BlockUnit[] = [];
+  if (boundaryRefNum === null) return units; // 兜底：边界不明，一块都不扔
   for (const b of state.blocks) {
     if (!b.active) continue; // 扔过的（active:false）不再进候选
     const ids = b.effectiveMessageIds ?? [];
@@ -745,28 +762,24 @@ export function collectBlockCandidates(
     const summaryChars = summary.length;
     if (summaryChars < minSummaryChars) continue; // 够大：同一把尺子
     if (summary.startsWith("[evicted:")) continue; // 驱逐标记本身不再被扔
-    let maxIdx = -1;
-    let inView = false;
+    // 保护区：命中「最近 N 条 user / 末尾几条」就不扔。注意 protectedIds
+    // 由调用方剔除会话根（第一条 user）——大块天然覆盖会话根，带上它会把
+    // 所有老块误挡掉；会话根由 kernel 自己硬 pin，不受扔块影响。
     let hitsProtected = false;
     for (const id of ids) {
-      const base = baseId(id);
-      if (protectedIds.has(base)) {
+      if (protectedIds.has(baseId(id))) {
         hitsProtected = true;
         break;
       }
-      const idx = indexByBase.get(base);
-      if (idx !== undefined) {
-        inView = true;
-        if (idx > maxIdx) maxIdx = idx;
-      }
     }
-    if (hitsProtected || !inView) continue; // 保护区 / 不在主视图
-    if (maxIdx >= boundaryIndex) continue; // 封盘线之前（一块都不能跳过）
+    if (hitsProtected) continue;
     // kernel 的 block-map 规则：优先用块自己存的 ref 范围（折叠时就记好的），
     // 老会话没有再用 effectiveMessageIds 首尾去 byRaw 反查。
     const startRef = b.startRef ?? state.messageRefs.byRaw[baseId(ids[0]!)];
     const endRef = b.endRef ?? state.messageRefs.byRaw[baseId(ids[ids.length - 1]!)];
     if (isBadRef(startRef) || isBadRef(endRef)) continue;
+    const endRefNum = refNumber(endRef);
+    if (endRefNum === null || endRefNum >= boundaryRefNum) continue; // 未封盘 / 无法判定
     units.push({
       kind: "block",
       blockId: b.blockId,
@@ -988,6 +1001,23 @@ export function maybeEvict(
     protectedIds.add(baseId(messages[i]!.id));
   }
 
+  // 块候选专用的保护区：和上面一样，但**不含第一条 user（会话根）**。
+  // 大块天然覆盖会话根（实测 b540 覆盖 11653 条、从会话第一条开始），把会话根
+  // 放进 hitsProtected 会把所有老块误挡掉；会话根由 kernel 自己硬 pin，扔块
+  // 动不到它，applyCompression 仍传完整的 protectedIds。
+  const blockProtectedIds = new Set<string>();
+  for (const idx of userIdx.slice(-recent)) blockProtectedIds.add(baseId(messages[idx]!.id));
+  for (let i = messages.length - 1; i >= Math.max(0, messages.length - recent); i--) {
+    blockProtectedIds.add(baseId(messages[i]!.id));
+  }
+
+  // 封盘线的 ref 数值（补丁一）：优先取 boundary 那条消息自己的 ref，退回
+  // sleep.json 的 boundary 字段。解析不出 → null → 一块都不扔（保守兜底）。
+  const boundaryMsg = messages[boundaryIndex];
+  const boundaryByIdRef = boundaryMsg ? state.messageRefs.byRaw[baseId(boundaryMsg.id)] : undefined;
+  const boundaryRef = isBadRef(boundaryByIdRef) ? gate.marker?.boundary : boundaryByIdRef;
+  const boundaryRefNum = refNumber(boundaryRef);
+
   // 已被 active block 折叠过的原文，不能再当候选：手动端点喂的是客户端原始
   // 快照（含全部原文），不剔除它们就会切出几百个「folded nothing — already
   // covered by active block(s)」的块，逐个提交全被 kernel 拒（2026-11-03 实测
@@ -1056,11 +1086,12 @@ export function maybeEvict(
 
   // 驱逐重做：新增候选来源 —— active 摘要块本身。用同一把睡眠闸门 /
   // 保护区尺子，结果并入本轮计划；原来的 Episode 候选一行不动。
+  // 补丁一：封盘线用 boundary 的 ref 数值（boundaryRefNum）与块的 endRef 数值比，
+  // 不再要求块的原文出现在当前视图里。
   const blockCandidates = collectBlockCandidates(
-    messages,
     state,
-    boundaryIndex,
-    protectedIds,
+    boundaryRefNum,
+    blockProtectedIds,
     Math.max(1, Math.floor(evict.minToolResultChars ?? 200)),
   );
 
@@ -1257,8 +1288,18 @@ export function maybeEvict(
   // 视图里那块长摘要就此消失。
   let appliedBlocks = 0;
   let reclaimedBlockChars = 0;
+  // 真实生效配置 compress.minSummaryLength 默认 50；一行的短标记只有 ~40 字符，
+  // 会被 kernel 的 validateSummaryLength 整批拒掉（补丁一实测：38 字符 →
+  // blocksCreated=0，68 字符 → 1）。这里按配置动态补齐，不硬编码长度。
+  const minSummaryLength =
+    typeof config.compress?.minSummaryLength === "number" && config.compress.minSummaryLength > 0
+      ? Math.floor(config.compress.minSummaryLength)
+      : 0;
   for (const unit of blockCandidates) {
-    const marker = `[evicted: 块 ${unit.blockId} · 折叠于 ${new Date(unit.createdTurn).toISOString().slice(11, 16)} · 原文 ${unit.effectiveMessageIds.length} 条]`;
+    const base = `[evicted: 块 ${unit.blockId} · 折叠于 ${new Date(unit.createdTurn).toISOString().slice(11, 16)} · 原文 ${unit.effectiveMessageIds.length} 条 · 已归档，摘要整体丢弃，仅留此标记供回溯]`;
+    const marker = base.length >= minSummaryLength
+      ? base
+      : base + " · " + "归档".repeat(Math.ceil((minSummaryLength - base.length) / 2) + 1);
     const range = [{ startRef: unit.startRef, endRef: unit.endRef, summary: marker }];
     const trialState = deactivateBlock(newState, [unit.blockId]);
     try {

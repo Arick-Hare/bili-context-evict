@@ -26,7 +26,9 @@ function cfg(over: Partial<Config> = {}): Config {
     promotionThreshold: 5,
     truncate: { threshold: 1 },
     merge: { maxSummaryLength: 3000, minOldGenBlocks: 3 },
-    compress: { minCompressRange: 0, maxSummaryLength: 0, minSummaryLength: 0 },
+    // 补丁一：真实生效配置的 minSummaryLength=50。上轮这里设成 0，掩盖了
+    // 「一行 evicted 标记太短被 kernel 整批拒」的 bug —— 必须用真实值。
+    compress: { minCompressRange: 0, maxSummaryLength: 20000, minSummaryLength: 50 },
     protectedTools: [],
     preserveRecentMessages: 0,
     preserveRecentTokens: 0,
@@ -37,6 +39,14 @@ function cfg(over: Partial<Config> = {}): Config {
 
 const core = createCore();
 const config = cfg();
+
+/** 与 src/evict.ts 里的标记补齐逻辑一致（含 minSummaryLength 动态补齐）。 */
+function evictMarker(blockId: string, n: number, minSummaryLength = 50): string {
+  const base = `[evicted: 块 ${blockId} · 折叠于 12:00 · 原文 ${n} 条 · 已归档，摘要整体丢弃，仅留此标记供回溯]`;
+  return base.length >= minSummaryLength
+    ? base
+    : base + " · " + "归档".repeat(Math.ceil((minSummaryLength - base.length) / 2) + 1);
+}
 
 /** 造 8 条原文，把 m1..m4 折成一个 active 块（长摘要）。 */
 function setup() {
@@ -65,7 +75,8 @@ test("deactivate 旧块后，同范围 applyCompression 能造出新块（不被
   const trial = deactivateBlock(state, [old.blockId]);
   assert.equal(trial.blocks.find((b) => b.blockId === old.blockId)!.active, false, "旧块已标 inactive");
 
-  const marker = "[evicted: 块 b1 · 折叠于 12:00 · 原文 4 条]";
+  const marker = evictMarker("b1", 4);
+  assert.ok(marker.length >= config.compress.minSummaryLength, "标记长度必须过 kernel 校验");
   const res = core.applyCompression({
     ranges: [{ startRef, endRef, summary: marker }],
     messages,
@@ -89,7 +100,7 @@ test("prune 后旧长摘要消失、只剩 evicted 标记（视图真的变小�
   const beforeChars = before.reduce((n, m) => n + ((m as { text?: string }).text?.length ?? 0), 0);
 
   const trial = deactivateBlock(state, [old.blockId]);
-  const marker = "[evicted: 块 b1 · 折叠于 12:00 · 原文 4 条]";
+  const marker = evictMarker("b1", 4);
   const res = core.applyCompression({
     ranges: [{ startRef, endRef, summary: marker }],
     messages,
@@ -108,11 +119,11 @@ test("prune 后旧长摘要消失、只剩 evicted 标记（视图真的变小�
 });
 
 test("不会重复扔：新块已是 evicted 标记，旧块 inactive 不再被 collectBlockCandidates 选中", async () => {
-  const { collectBlockCandidates } = await import("./src/evict.js");
+  const { collectBlockCandidates, refNumber } = await import("./src/evict.js");
   const { messages, state, startRef, endRef } = setup();
   const old = state.blocks.find((b) => b.active)!;
   const trial = deactivateBlock(state, [old.blockId]);
-  const marker = "[evicted: 块 b1 · 折叠于 12:00 · 原文 4 条]";
+  const marker = evictMarker("b1", 4);
   const res = core.applyCompression({
     ranges: [{ startRef, endRef, summary: marker }],
     messages,
@@ -120,12 +131,34 @@ test("不会重复扔：新块已是 evicted 标记，旧块 inactive 不再被 
     config,
     protectedMessageIds: new Set<string>(),
   });
+  // 补丁一新签名：boundary 用 ref 数值（放到很大，所有块都算已封盘）
   const units = collectBlockCandidates(
-    messages,
     res.state,
-    messages.length, // boundary 放到最后：所有原文都算封盘
+    Math.max(...res.state.blocks.map((b) => refNumber(b.endRef) ?? 0)) + 1000,
     new Set<string>(),
     200,
   );
   assert.equal(units.length, 0, "旧块 inactive + 新块是标记，都不该再进候选");
+});
+
+test("补丁一回归：短标记被 kernel 拒，补齐后才成功（真实 minSummaryLength=50）", () => {
+  const { messages, state, startRef, endRef } = setup();
+  const old = state.blocks.find((b) => b.active)!;
+  const trial = deactivateBlock(state, [old.blockId]);
+  const short = "[evicted: 块 b1 · 折叠于 12:00 · 原文 4 条]";
+  assert.ok(short.length < config.compress.minSummaryLength, "前置：短标记确实短于 50");
+  const rejected = core.applyCompression({
+    ranges: [{ startRef, endRef, summary: short }],
+    messages, state: trial, config, protectedMessageIds: new Set<string>(),
+  });
+  assert.equal(rejected.result.blocksCreated, 0, "短标记应被 summary-length 校验拒掉");
+  assert.match((rejected.result.errors ?? []).join(" "), /summary-length/i);
+
+  const long = evictMarker("b1", 4);
+  assert.ok(long.length >= config.compress.minSummaryLength);
+  const accepted = core.applyCompression({
+    ranges: [{ startRef, endRef, summary: long }],
+    messages, state: trial, config, protectedMessageIds: new Set<string>(),
+  });
+  assert.equal(accepted.result.blocksCreated, 1, "补齐后应能造块");
 });
