@@ -81,10 +81,14 @@ test("验收 2：boundarySeq > 该会话 max(seq) → 关闸门（boundary-beyon
 });
 
 test("验收 3：没有该会话的 marker → 关闸门（no-session-marker），不回落全局", () => {
-  writeMarker(SID, { boundarySeq: 19900 });
+  // 先造一个「看起来可用」的全局文件：若实现回落到全局，这里就会被放行。
+  const global = sleepFilePath();
+  mkdirSync(path.dirname(global), { recursive: true });
+  writeFileSync(global, JSON.stringify({ sessionId: SID, boundarySeq: 19900, archived: ARCHIVED }), "utf8");
+  // 但该会话目录没有 marker。
   rmSync(sleepMarkerPath(SID), { force: true });
   const r = gate(SID, stubDb());
-  assert.equal(r.ok, false);
+  assert.equal(r.ok, false, "有全局文件也不该放行");
   assert.match(r.reason ?? "", /no-session-marker/);
 });
 
