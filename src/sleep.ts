@@ -10,20 +10,27 @@
  *  - 两个都找不到，就完全不动 —— 宁可少丢，不能丢错。
  *  - archived 指向 handoff 产出的归档文件，必须存在且非空，否则不认这个标记。
  *
- * 补丁二（2026-11-08）：
- *  - sleep.json 加会话身份 `sessionId`。m 编号每会话各一套，同一份全局
- *    sleep.json 拿去量多个会话是错的；身份不符一律关闸门。
- *  - `boundarySeq` 优先（seq 单调递增、永不重编号），没有则用 `boundary`
- *    的 mNNNNN 查 index.db 换 seq（**必须带 session_id**）。
- *  - 老文件无 sessionId：仅当唯一一个会话开着驱逐时按老逻辑继续并打迁移警告，
- *    否则关闸门。
- *  - reason 分级：不再把所有失败合成一句「找不到」。
+ * 补丁二（2026-11-08）：`boundarySeq` 优先（seq 单调递增、永不重编号），
+ *  没有则用 `boundary` 的 mNNNNN 查 index.db 换 seq（**必须带 session_id**）。
+ *  reason 分级：不再把所有失败合成一句「找不到」。
+ *
+ * 会话隔离方案（2026-11-08 晚，针对 19:35 那次事故）：
+ *  - 根因：单份全局 sleep.json + 只比一次 sessionId，新会话会拿旧会话的
+ *    boundarySeq 当边界 → 自己所有块都在边界之前 → 每轮都判「全都能扔」。
+ *  - 改为**每会话一份** marker：`configDir()/sessions/<sessionId>/sleep.json`。
+ *    读不到就关闸门（`no-session-marker`），**不回落全局文件**；身份由文件
+ *    位置保证，不再靠 marker.sessionId 字段猜。
+ *  - `boundarySeq > 该会话 max(seq)` → 关闸门（`boundary-beyond-session`），
+ *    写 warn 带上两个数。
+ *  - 启动时一次性迁移：全局 `~/.dsh/heart/sleep.json` 复制到旧会话目录，
+ *    原文件改名 `.migrated-<日期>` 不删。
  */
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync, statSync, mkdirSync, copyFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import type { CompressionState, CoreMessage } from "acp-kernel";
 import type { EvictDbView } from "./evict-db.js";
+import { configDir } from "./paths.js";
 
 export interface SleepMarker {
   /** ISO 时间，写标记的时刻。 */
@@ -65,14 +72,14 @@ export interface SleepGateResult {
 export interface SleepGateOpts {
   sleepFile?: string;
   sttRoot?: string;
-  /** 当前会话 id（补丁二：验 sleep.json 身份）。 */
+  /** 当前会话 id（会话隔离：决定读哪个目录的 marker，并对账 max(seq)）。 */
   sessionId?: string;
-  /** 开着驱逐的会话数（去掉 "*" 后的唯一 base 数）；老文件迁移判定用。 */
-  evictingSessionCount?: number;
-  /** 只读 DB 视图；缺省时 boundary 的 mNNNNN 无法换 seq。 */
+  /** 只读 DB 视图；缺省时 boundary 的 mNNNNN 无法换 seq、max(seq) 也无法对账。 */
   db?: EvictDbView;
   /** 4.3 配置项：false 时完全忽略 sleep.json，只按水位触发。 */
   boundaryFromSleep?: boolean;
+  /** 可选日志回调：关闸门时（尤其 boundary-beyond-session）打出 warn。 */
+  log?: (msg: string) => void;
 }
 
 function baseId(id: string): string {
@@ -96,6 +103,72 @@ export function sleepFilePath(explicit?: string): string {
   const p = explicit?.trim();
   if (p) return path.resolve(expandHome(p));
   return path.join(dshHomeDir(), "heart", "sleep.json");
+}
+
+/**
+ * 会话隔离：每会话一份 marker 的路径。
+ * `configDir()/sessions/<sessionId>/sleep.json`（XDG 感知，不写死盘符/用户）。
+ */
+export function sleepMarkerPath(sessionId: string): string {
+  const sid = String(sessionId ?? "").trim();
+  return path.join(configDir(), "sessions", sid, "sleep.json");
+}
+
+/** 只读该会话的 marker；目录或文件不存在返回 null（关闸门依据）。 */
+export function readSleepMarkerForSession(sessionId: string): SleepMarker | null {
+  return readSleepMarker(sleepMarkerPath(sessionId));
+}
+
+/** 原子写 JSON：先写 `<file>.tmp` 再 rename 覆盖，防写到一半断电留半截。 */
+export function atomicWriteJson(file: string, obj: unknown): void {
+  mkdirSync(path.dirname(file), { recursive: true });
+  const tmp = `${file}.tmp`;
+  writeFileSync(tmp, JSON.stringify(obj, null, 2) + "\n", "utf8");
+  renameSync(tmp, file);
+}
+
+let migrationDone = false;
+/**
+ * 会话隔离·迁移：把旧的全局 `~/.dsh/heart/sleep.json` 一次性复制到对应会话
+ * 目录，原文件改名 `.migrated-<日期>` 不删。模块级只跑一次。
+ *  - marker 有 sessionId → 复制到 `<configDir>/sessions/<sessionId>/sleep.json`；
+ *  - 无 sessionId（极老文件）→ 放进 `<configDir>/sessions/_legacy/`，不参与驱逐；
+ *  - 目标已存在 → 不覆盖，只把全局文件改名让路；
+ *  - 全局文件不存在 → 什么都不做（直接用 per-session 文件）。
+ */
+export function ensureSleepMigration(evict: { sleepFile?: string }, log?: (msg: string) => void): void {
+  if (migrationDone) return;
+  migrationDone = true;
+  const global = sleepFilePath(evict.sleepFile);
+  if (!existsSync(global)) return;
+  const marker = readSleepMarker(global);
+  const sid = typeof marker?.sessionId === "string" && marker.sessionId.trim() !== "" ? marker.sessionId.trim() : "_legacy";
+  const dir = path.join(configDir(), "sessions", sid);
+  const target = path.join(dir, "sleep.json");
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  if (existsSync(target)) {
+    // 该会话已有 per-session marker（用户新建的），不要覆盖，只把全局文件让路。
+    safeRenameAway(global);
+    log?.(`[sleep][migrate] 会话 ${sid} 已有 per-session marker，全局 ${global} 已让路（改名），未覆盖`);
+    return;
+  }
+  try {
+    copyFileSync(global, target);
+    safeRenameAway(global);
+    log?.(`[sleep][migrate] 全局 ${global} 已复制到 ${target}，原文件改名保留`);
+  } catch (e) {
+    log?.(`[sleep][migrate] 复制失败，保持原文件不动：${String(e).slice(0, 200)}`);
+  }
+}
+
+/** 把全局文件改名 `<file>.migrated-<YYYYMMDD>`（内容还在，不删）。 */
+function safeRenameAway(file: string): void {
+  try {
+    const tag = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+    renameSync(file, `${file}.migrated-${tag}`);
+  } catch {
+    /* 改名失败不致命：下次仍会重试（migrationDone 已置位，不会重复复制） */
+  }
 }
 
 /** stt 根：桌面 profile 下的 stt（say.mjs / daily / old-session 都在那里）。 */
@@ -230,51 +303,34 @@ export function resolveBoundaryIndex(
   return null;
 }
 
-/** 纯函数：解析 boundary 的 seq + reason 分级。导出供单测直接验（验收 1/2/3）。 */
+/**
+ * 纯函数：解析 boundary 的 seq + reason 分级。导出供单测直接验（验收 1/2/3）。
+ * 会话隔离后不再做「sessionId 字段严格校验」（文件位置本身就是身份），
+ * 但会多一步 `boundary-beyond-session` 越界校验（boundarySeq 超过该会话
+ * 真实 max(seq) 时关闸门，绝不拿别的会话的封盘线量自己）。
+ */
 export function resolveBoundarySeq(
   marker: SleepMarker,
   opts: {
     sessionId?: string;
-    evictingSessionCount?: number;
     db?: EvictDbView;
+    log?: (msg: string) => void;
   } = {},
 ): {
   ok: boolean;
   seq?: number;
   how?: SleepGateResult["how"];
   reason?: string;
-  migrationWarning?: string;
 } {
-  const { sessionId, evictingSessionCount, db } = opts;
+  const { sessionId, db, log } = opts;
 
-  // ① 身份校验（文档 2.5 读取顺序第 1 条）
-  if (typeof marker.sessionId === "string" && marker.sessionId.trim() !== "") {
-    if (!sessionId || marker.sessionId.trim() !== sessionId) {
-      return {
-        ok: false,
-        reason: `边界属于另一个会话（sleep.json.sessionId=${marker.sessionId}，当前=${sessionId ?? "未知"}），闸门关闭，不做任何猜测`,
-      };
-    }
-  } else {
-    // 老文件迁移：仅当唯一一个会话开着驱逐时放行，并打迁移警告。
-    const n = evictingSessionCount ?? 0;
-    if (n > 1) {
-      return { ok: false, reason: `sleep.json 缺 sessionId，且当前有 ${n} 个会话开着驱逐，无法判定边界归属，闸门关闭` };
-    }
-  }
-
-  // ② boundarySeq 优先
+  // ① boundarySeq 优先
   const explicitSeq = marker.boundarySeq;
   if (typeof explicitSeq === "number" && Number.isInteger(explicitSeq) && explicitSeq > 0) {
-    return {
-      ok: true,
-      seq: explicitSeq,
-      how: "seq",
-      migrationWarning: marker.sessionId ? undefined : "sleep.json 缺 sessionId，已按老逻辑放行；请尽快补写会话身份",
-    };
+    return beyondCheck(explicitSeq, sessionId, db, "seq", log);
   }
 
-  // ③ boundary 的 mNNNNN 查库换 seq（必须带 session_id）
+  // ② boundary 的 mNNNNN 查库换 seq（必须带 session_id）
   const boundary = typeof marker.boundary === "string" ? marker.boundary.trim() : "";
   const refNum = boundary ? boundaryRefNum(boundary) : null;
   if (refNum !== null) {
@@ -288,15 +344,10 @@ export function resolveBoundarySeq(
     if (seq === null) {
       return { ok: false, reason: `boundary（${boundary}）在 index.db 的 session_id=${sessionId} 里查不到 seq，闸门关闭` };
     }
-    return {
-      ok: true,
-      seq,
-      how: "ref",
-      migrationWarning: marker.sessionId ? undefined : "sleep.json 缺 sessionId，已按老逻辑放行；请尽快补写会话身份",
-    };
+    return beyondCheck(seq, sessionId, db, "ref", log);
   }
 
-  // ④ tail：仅当身份对得上时（① 已保证），交给旧逻辑在视图里找
+  // ③ tail 只能定位旧视图，无法给出 seq
   const tail = typeof marker.tail === "string" ? normalizeTail(marker.tail) : "";
   if (tail.length >= 4) {
     return {
@@ -305,11 +356,30 @@ export function resolveBoundarySeq(
     };
   }
 
-  // ⑤ 全都没有
+  // ④ 全都没有
   return {
     ok: false,
     reason: "sleep.json 缺 boundarySeq、boundary 不是 mNNNNN、tail 也不可用，无法判定封盘线，闸门关闭",
   };
+}
+
+/** boundarySeq 超过该会话真实 max(seq) → 越界关闸门（会话隔离核心校验）。 */
+function beyondCheck(
+  seq: number,
+  sessionId: string | undefined,
+  db: EvictDbView | undefined,
+  how: SleepGateResult["how"],
+  log?: (msg: string) => void,
+): { ok: boolean; seq?: number; how?: SleepGateResult["how"]; reason?: string } {
+  if (db?.available && sessionId) {
+    const maxSeq = db.maxSeq(sessionId);
+    if (maxSeq !== null && seq > maxSeq) {
+      const reason = `boundary 的 boundarySeq=${seq} 超过该会话最大 seq=${maxSeq}，闸门关闭（boundary-beyond-session）`;
+      log?.(`[sleep] ${reason}`);
+      return { ok: false, reason };
+    }
+  }
+  return { ok: true, seq, how };
 }
 
 export function checkSleepGate(
@@ -336,10 +406,18 @@ export function checkSleepGate(
     };
   }
 
-  const file = sleepFilePath(opts.sleepFile);
-  const marker = readSleepMarker(file);
+  // 会话隔离：读「本次要驱逐的会话」自己的 marker；读不到直接关闸门，
+  // 不回落全局文件（宁可不动，也不能拿别的会话的封盘线量自己）。
+  const sid = opts.sessionId;
+  if (!sid) {
+    return { ok: false, reason: "没有当前会话 id，无法定位 per-session sleep.json，闸门关闭（no-session-marker）" };
+  }
+  const marker = readSleepMarkerForSession(sid);
   if (!marker) {
-    return { ok: false, reason: `没有可用的 sleep.json（${file}），还没封盘，不动` };
+    return {
+      ok: false,
+      reason: `没有该会话的 sleep.json（${sleepMarkerPath(sid)}），还没封盘，闸门关闭（no-session-marker）`,
+    };
   }
   const archivedAbs = verifyArchive(sttRootDir(opts.sttRoot), marker.archived);
   if (!archivedAbs) {
@@ -351,14 +429,11 @@ export function checkSleepGate(
 
   const seqResult = resolveBoundarySeq(marker, {
     sessionId: opts.sessionId,
-    evictingSessionCount: opts.evictingSessionCount,
     db: opts.db,
+    log: opts.log,
   });
   if (!seqResult.ok || seqResult.seq === undefined) {
     return { ok: false, reason: seqResult.reason };
-  }
-  if (seqResult.migrationWarning) {
-    // 由调用方 log 打出去（这里不直接 log，保持纯函数语义）。
   }
 
   const boundarySeq = seqResult.seq;
@@ -381,6 +456,5 @@ export function checkSleepGate(
     marker,
     archivedAbs,
     how: seqResult.how,
-    migrationWarning: seqResult.migrationWarning,
   };
 }

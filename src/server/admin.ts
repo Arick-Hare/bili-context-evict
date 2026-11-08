@@ -28,7 +28,7 @@ import { featureOverrideAbsent } from "../rollout.js";
 import { listSessions, memoryReport, peekSession, splitSessionWarnings, totalInFlight, getSession, markDirty } from "../session.js";
 import { maybeEvict, resolveEvictConfig, lastRequestSnapshot, collectBlockCandidatesDetailed, type EvictConfig } from "../evict.js";
 import { readEvictionHistory, recordEviction } from "../evict-history.js";
-import { checkSleepGate, resolveBoundarySeq, readSleepMarker, sleepFilePath, boundaryRefNum } from "../sleep.js";
+import { checkSleepGate, resolveBoundarySeq, readSleepMarkerForSession } from "../sleep.js";
 import { openEvictDb, type EvictDbView } from "../evict-db.js";
 import { BILI_TUNNEL_HEADER } from "../tunnel-guard.js";
 import { isLoopbackAddress } from "../util.js";
@@ -206,13 +206,9 @@ function previewBoundarySeq(sessionId: string, evict: EvictConfig, db: EvictDbVi
     if (evict.boundaryFromSleep === false) {
         return db.available ? db.maxSeq(sessionId) : null;
     }
-    const marker = readSleepMarker(sleepFilePath(evict.sleepFile));
+    const marker = readSleepMarkerForSession(sessionId);
     if (!marker) return null;
-    if (marker.sessionId && marker.sessionId !== sessionId) return null;
-    const n = (evict.sessions ?? []).includes("*")
-        ? 2
-        : new Set((evict.sessions ?? []).map((s) => s.split("|sub:")[0])).size;
-    const r = resolveBoundarySeq(marker, { sessionId, evictingSessionCount: n, db });
+    const r = resolveBoundarySeq(marker, { sessionId, db });
     return r.ok ? r.seq ?? null : null;
 }
 
@@ -221,8 +217,6 @@ function buildEvictStatus(): Record<string, unknown> {
     const evict = resolveEvictConfig(loadConfigFile().evict, process.env);
     const db = openEvictDb();
     const sessions = (evict.sessions ?? []).map((s) => s.split("|sub:")[0]);
-    const n = sessions.includes("*") ? 2 : new Set(sessions).size;
-    const marker = readSleepMarker(sleepFilePath(evict.sleepFile));
     const history = readEvictionHistory(1)[0] as unknown as Record<string, unknown> | undefined;
     const perSession = [...new Set(sessions.filter((s) => s !== "*"))].map((sid) => {
         const session = getSession(sid);
@@ -231,7 +225,6 @@ function buildEvictStatus(): Record<string, unknown> {
                 sleepFile: evict.sleepFile,
                 sttRoot: evict.sttRoot,
                 sessionId: sid,
-                evictingSessionCount: n,
                 db,
                 boundaryFromSleep: evict.boundaryFromSleep,
             })
@@ -245,27 +238,29 @@ function buildEvictStatus(): Record<string, unknown> {
             // 原样显示 reason，不吞成「未知错误」。
             gateReason: gate?.reason ?? null,
             gateHow: gate?.how ?? null,
-            boundary: gate?.marker?.boundary ?? marker?.boundary ?? null,
-            boundarySeq: gate?.boundarySeq ?? marker?.boundarySeq ?? null,
-            boundaryAt: gate?.marker?.at ?? marker?.at ?? null,
-            boundarySource: gate?.fromWaterline ? "waterline" : marker ? "sleep.json" : null,
-            archived: gate?.marker?.archived ?? marker?.archived ?? null,
+            boundary: gate?.marker?.boundary ?? null,
+            boundarySeq: gate?.boundarySeq ?? null,
+            boundaryAt: gate?.marker?.at ?? null,
+            boundarySource: gate?.fromWaterline ? "waterline" : gate?.marker ? "sleep.json" : null,
+            archived: gate?.marker?.archived ?? null,
             migrationWarning: gate?.migrationWarning ?? null,
+            marker: gate?.marker ?? null,
         };
     });
     return {
         ok: true,
         dbAvailable: db.available,
+        availableSessions: listSessions()
+            .slice()
+            .sort((a, b) => b.lastSeen - a.lastSeen)
+            .slice(0, 30)
+            .map((s) => ({ id: s.id, lastSeen: s.lastSeen })),
         config: {
             enabled: evict.enabled, budget: evict.budget, target: evict.target,
             dryRun: evict.dryRun, boundaryFromSleep: evict.boundaryFromSleep,
             seqRefCheck: evict.seqRefCheck, sessions: evict.sessions ?? [],
         },
-        marker: marker ? {
-            sessionId: marker.sessionId ?? null, boundary: marker.boundary ?? null,
-            boundarySeq: marker.boundarySeq ?? null, at: marker.at ?? null,
-            archived: marker.archived ?? null,
-        } : null,
+        marker: perSession.length > 0 ? perSession[0]!.marker ?? null : null,
         sessions: perSession,
         lastEviction: history ?? null,
     };
@@ -278,10 +273,12 @@ async function handleEvictNow(
     log: (level: string, msg: string) => void,
     /** 4.2「看一眼候选」：只跑 dryRun，不写回、不记录。 */
     dryRunOverride?: boolean,
+    /** 页面上勾选的会话；给了就覆盖配置里的 evict.sessions（不写盘）。 */
+    sessionsOverride?: string[],
 ): Promise<void> {
     const baseEvict = resolveEvictConfig(loadConfigFile().evict, process.env);
     const evict = dryRunOverride === undefined ? baseEvict : { ...baseEvict, dryRun: dryRunOverride };
-    const sessions = evict.sessions ?? [];
+    const sessions = sessionsOverride && sessionsOverride.length > 0 ? sessionsOverride : (evict.sessions ?? []);
     log("info", `[evict-manual] 手动驱逐：enabled=${evict.enabled} budget=${evict.budget} target=${evict.target} dryRun=${evict.dryRun} sessions=${JSON.stringify(sessions)}`);
     const results: Array<Record<string, unknown>> = [];
     // "*" = 当前进程内所有活跃会话（去掉 |sub: 派生 lane、去重）。不扫磁盘
@@ -302,7 +299,7 @@ async function handleEvictNow(
             // 取「boundarySeq 之后的消息 + active 块 summary 占位」组最小视图。
             // 仍然为空才跳过，reason 写明是哪一步缺的。
             if (messages.length === 0) {
-                const marker = readSleepMarker(sleepFilePath(evict.sleepFile));
+                const marker = readSleepMarkerForSession(base);
                 const seqHint = typeof marker?.boundarySeq === "number" ? marker.boundarySeq : 0;
                 const minimal = db.available ? db.minimalView(base, seqHint, session.state) : null;
                 if (minimal && minimal.length > 0) {
@@ -490,16 +487,20 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
     // body {"dryRun":true} 或 ?dryRun=1 → 4.2「看一眼候选」，只观察不写回。
     if (req.method === "POST" && (req.url ?? "").startsWith("/__bili/evict-now")) {
         let wantDryRun: boolean | undefined;
+        let sessionsOverride: string[] | undefined;
         const q = new URL(req.url ?? "/__bili/evict-now", "http://localhost").searchParams;
         if (q.get("dryRun") === "1" || q.get("dryRun") === "true") wantDryRun = true;
         try {
             const raw = (await readBody(req)).toString("utf8");
             if (raw) {
-                const b = JSON.parse(raw) as { dryRun?: unknown };
+                const b = JSON.parse(raw) as { dryRun?: unknown; sessions?: unknown };
                 if (typeof b.dryRun === "boolean") wantDryRun = b.dryRun;
+                if (Array.isArray(b.sessions)) {
+                    sessionsOverride = b.sessions.filter((s): s is string => typeof s === "string" && s.length > 0);
+                }
             }
         } catch { /* 无 body / 非法 JSON 按配置默认 */ }
-        return handleEvictNow(res, core, config, log, wantDryRun);
+        return handleEvictNow(res, core, config, log, wantDryRun, sessionsOverride);
     }
     if (req.method === "GET" && (req.url === "/__bili/sessions" || req.url?.startsWith("/__bili/sessions?"))) return sendWebSessions(res, req);
     if (req.method === "GET" && req.url?.startsWith("/__bili/logs")) return sendWebLogs(res, req);

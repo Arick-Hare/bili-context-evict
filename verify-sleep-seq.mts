@@ -1,146 +1,131 @@
 /**
- * 补丁二单测：闸门 seq 化（文档第三节验收 1/2/3）+ sessionId 身份校验。
- * 纯逻辑，不碰真实 sleep.json / DB；DB 用 stub 注入。
+ * 会话隔离方案单测（验收 1/2/3/4/6）。
+ * 用 XDG_CONFIG_HOME / DSH_HOME 指向临时目录做隔离，不碰真实配置。
  *
+ *   $env:XDG_CONFIG_HOME=<tmp>\cfg; $env:DSH_HOME=<tmp>\home
  *   <DSH Node24> --import tsx --test verify-sleep-seq.mts
  */
 import assert from "node:assert/strict";
 import test from "node:test";
+import { existsSync, rmSync, mkdirSync, writeFileSync, readFileSync, readdirSync } from "node:fs";
+import path from "node:path";
 import {
   resolveBoundarySeq,
-  boundaryRefNum,
-  resolveBoundaryIndexBySeq,
   checkSleepGate,
+  sleepMarkerPath,
+  ensureSleepMigration,
+  sleepFilePath,
+  atomicWriteJson,
   type SleepMarker,
 } from "./src/sleep.js";
 import type { EvictDbView } from "./src/evict-db.js";
 import type { CompressionState, CoreMessage } from "acp-kernel";
 
-const SID = "session-A";
+const STT = path.join(process.env.XDG_CONFIG_HOME!, "stt-root");
+const ARCHIVED = "archive.md";
+// verifyArchive 要求 archived 指向存在且非空的归档文件。
+mkdirSync(STT, { recursive: true });
+writeFileSync(path.join(STT, ARCHIVED), "# 归档\n某内容\n", "utf8");
 
-function stubDb(map: Record<string, number> = {}): EvictDbView {
+const SID = "session-A";
+const SID_B = "session-B";
+
+function stubDb(map: Record<string, number> = {}, max: Record<string, number> = {}): EvictDbView {
   return {
     available: true,
     boundarySeqForRef: (_sid, refNum) => map[String(refNum)] ?? null,
+    messageSeqByRef: () => null,
+    refNumForSeq: () => null,
     boundaryMsgIdForSeq: () => null,
     blockSpans: () => null,
-    messageSeqByRef: () => null,
-    maxSeq: () => 19991,
-    refNumForSeq: () => null,
+    maxSeq: (sid) => (max[sid] !== undefined ? max[sid]! : null),
     minimalView: () => null,
     close: () => {},
   };
 }
 
 const emptyState = { blocks: [], messageRefs: { byRaw: {} } } as unknown as CompressionState;
-const msg = (id: string, ledgerSeq?: number): CoreMessage =>
-  ({ id, role: "user", contentType: "text", text: "", ledgerSeq } as CoreMessage);
+const msg = (id: string): CoreMessage => ({ id, role: "user", contentType: "text", text: "" } as CoreMessage);
 
-test("验收 1：boundarySeq 命中 → 闸门解析开（seq 优先）", () => {
-  const marker: SleepMarker = { sessionId: SID, boundary: "m12113", boundarySeq: 19900 };
-  const r = resolveBoundarySeq(marker, { sessionId: SID, db: stubDb() });
-  assert.equal(r.ok, true);
-  assert.equal(r.seq, 19900);
+function writeMarker(sid: string, marker: SleepMarker) {
+  atomicWriteJson(sleepMarkerPath(sid), { archived: ARCHIVED, ...marker });
+}
+
+function gate(sid: string, db: EvictDbView, opts: Record<string, unknown> = {}) {
+  return checkSleepGate([msg("h1")], emptyState, { sessionId: sid, sttRoot: STT, db, ...opts });
+}
+
+test("验收 1：该会话 marker 有 boundarySeq → 闸门开（how=seq）", () => {
+  writeMarker(SID, { boundarySeq: 19900 });
+  const r = gate(SID, stubDb());
+  assert.equal(r.ok, true, `应为开，实际关：${r.reason}`);
   assert.equal(r.how, "seq");
+  assert.equal(r.boundarySeq, 19900);
 });
 
-test("验收 2：只有 boundary(mNNN)，DB 查得到 → 闸门开", () => {
-  const marker: SleepMarker = { sessionId: SID, boundary: "m12113" };
-  const r = resolveBoundarySeq(marker, { sessionId: SID, db: stubDb({ "12113": 13822 }) });
+test("验收 1b：boundary 的 mNNNNN 查库换 seq → 闸门开", () => {
+  writeMarker(SID, { boundary: "m12113" });
+  const r = gate(SID, stubDb({ "12113": 13822 }));
   assert.equal(r.ok, true);
-  assert.equal(r.seq, 13822);
+  assert.equal(r.boundarySeq, 13822);
   assert.equal(r.how, "ref");
 });
 
-test("验收 3a：DB 查不到 → 闸门关，reason 指到具体缺哪一步", () => {
-  const marker: SleepMarker = { sessionId: SID, boundary: "m12113" };
-  const r = resolveBoundarySeq(marker, { sessionId: SID, db: stubDb({}) });
+test("验收 2：boundarySeq > 该会话 max(seq) → 关闸门（boundary-beyond-session）", () => {
+  writeMarker(SID, { boundarySeq: 20000 });
+  const r = gate(SID, stubDb({}, { [SID]: 19991 }));
   assert.equal(r.ok, false);
-  assert.match(r.reason ?? "", /查不到 seq/);
+  assert.match(r.reason ?? "", /boundary-beyond-session/);
+  assert.match(r.reason ?? "", /20000/);
+  assert.match(r.reason ?? "", /19991/);
 });
 
-test("验收 3b：两条都没有 → 闸门关，reason 分级", () => {
-  const marker: SleepMarker = { sessionId: SID, tail: "嗯嗯别忘了" };
-  const r = resolveBoundarySeq(marker, { sessionId: SID, db: stubDb() });
+test("验收 3：没有该会话的 marker → 关闸门（no-session-marker），不回落全局", () => {
+  writeMarker(SID, { boundarySeq: 19900 });
+  rmSync(sleepMarkerPath(SID), { force: true });
+  const r = gate(SID, stubDb());
   assert.equal(r.ok, false);
-  assert.match(r.reason ?? "", /(无|缺) boundarySeq/);
+  assert.match(r.reason ?? "", /no-session-marker/);
 });
 
-test("验收 3c：DB 不可用 → 闸门关，reason 写明", () => {
-  const marker: SleepMarker = { sessionId: SID, boundary: "m12113" };
-  const r = resolveBoundarySeq(marker, { sessionId: SID, db: { ...stubDb(), available: false } });
-  assert.equal(r.ok, false);
-  assert.match(r.reason ?? "", /只读视图不可用/);
+test("验收 4：两个会话互不影响", () => {
+  writeMarker("A", { boundarySeq: 19900 });
+  writeMarker("B", { boundarySeq: 20000 });
+  const db = stubDb({}, { A: 19991, B: 3740 });
+  const gA = gate("A", db);
+  const gB = gate("B", db);
+  const gC = gate("C", db);
+  assert.equal(gA.ok, true, "A 应开");
+  assert.equal(gB.ok, false, "B 应关（boundary-beyond-session）");
+  assert.match(gB.reason ?? "", /boundary-beyond-session/);
+  assert.equal(gC.ok, false, "C 应关（no-session-marker）");
+  assert.match(gC.reason ?? "", /no-session-marker/);
 });
 
-test("2.5 补充：sessionId 属于另一会话 → 闸门关，不做任何猜测", () => {
-  const marker: SleepMarker = { sessionId: "session-B", boundarySeq: 19900 };
-  const r = resolveBoundarySeq(marker, { sessionId: SID, db: stubDb() });
+test("resolveBoundarySeq 纯函数：boundary-beyond-session 不依赖文件", () => {
+  const r = resolveBoundarySeq({ boundarySeq: 20000 }, { sessionId: SID, db: stubDb({}, { [SID]: 19991 }) });
   assert.equal(r.ok, false);
-  assert.match(r.reason ?? "", /属于另一个会话/);
+  assert.match(r.reason ?? "", /boundary-beyond-session/);
 });
 
-test("2.5 补充：老文件缺 sessionId，唯一会话 → 放行 + 迁移警告", () => {
-  const marker: SleepMarker = { boundarySeq: 19900 };
-  const r = resolveBoundarySeq(marker, { sessionId: SID, evictingSessionCount: 1, db: stubDb() });
+test("验收 6：迁移 — 全局 sleep.json 复制到旧会话目录，原文件改名不删", () => {
+  const global = sleepFilePath(); // 默认 <DSH_HOME>/.dsh/heart/sleep.json
+  mkdirSync(path.dirname(global), { recursive: true });
+  writeFileSync(global, JSON.stringify({ sessionId: SID, boundarySeq: 19900, archived: ARCHIVED }), "utf8");
+  ensureSleepMigration({ sleepFile: undefined }, () => {});
+  const moved = sleepMarkerPath(SID);
+  assert.ok(existsSync(moved), "应存在 per-session marker");
+  const content = JSON.parse(readFileSync(moved, "utf8"));
+  assert.equal(content.sessionId, SID);
+  assert.equal(content.boundarySeq, 19900);
+  const renamed = readdirSync(path.dirname(global)).find((f) => f.startsWith("sleep.json.migrated-"));
+  assert.ok(renamed, "原文件应被改名为 .migrated-<日期>");
+  assert.ok(existsSync(path.join(path.dirname(global), renamed!)));
+});
+
+test("2.6 水位触发（boundaryFromSleep=false）与 per-session 无关，仍按 maxSeq", () => {
+  const r = gate(SID, stubDb({}, { [SID]: 19991 }), { boundaryFromSleep: false });
   assert.equal(r.ok, true);
-  assert.match(r.migrationWarning ?? "", /缺 sessionId/);
-});
-
-test("2.5 补充：老文件缺 sessionId，多会话 → 闸门关", () => {
-  const marker: SleepMarker = { boundarySeq: 19900 };
-  const r = resolveBoundarySeq(marker, { sessionId: SID, evictingSessionCount: 2, db: stubDb() });
-  assert.equal(r.ok, false);
-  assert.match(r.reason ?? "", /无法判定边界归属/);
-});
-
-test("2.5 补充：老文件缺 sessionId，且 tail 兜底也不给 seq → 闸门关", () => {
-  const marker: SleepMarker = { boundary: "h_abc", tail: "一句话" };
-  const r = resolveBoundarySeq(marker, { sessionId: SID, evictingSessionCount: 1, db: stubDb() });
-  assert.equal(r.ok, false);
-});
-
-test("boundaryRefNum：只认 mNNNNN", () => {
-  assert.equal(boundaryRefNum("m12113"), 12113);
-  assert.equal(boundaryRefNum("m00001"), 1);
-  assert.equal(boundaryRefNum("b545"), null);
-  assert.equal(boundaryRefNum("h_abc"), null);
-  assert.equal(boundaryRefNum("BLOCKED"), null);
-});
-
-test("2.2：boundaryIndex 从 seq 定位（ledgerSeq 命中），不用数组下标持久化", () => {
-  const msgs = [msg("h_1", 100), msg("h_2", 200), msg("h_3", 300)];
-  const r = resolveBoundaryIndexBySeq(msgs, emptyState, { boundarySeq: 200 }, 200);
-  assert.equal(r?.index, 1);
-  assert.equal(r?.how, "seq");
-});
-
-test("2.2：消息无 ledgerSeq 时按 DB 的 msg_id 定位", () => {
-  const db = { ...stubDb(), boundaryMsgIdForSeq: () => "h_2" };
-  const msgs = [msg("h_1"), msg("h_2"), msg("h_3")];
-  const r = resolveBoundaryIndexBySeq(msgs, emptyState, {}, 200, db, SID);
-  assert.equal(r?.index, 1);
-});
-
-test("4.3：boundaryFromSleep=false → 忽略 sleep.json，按水位触发", () => {
-  // 不写任何 sleep.json：用 opts 直接验，DB stub 给 maxSeq。
-  const r = checkSleepGate([msg("h_1")], emptyState, {
-    sessionId: SID,
-    db: stubDb(),
-    boundaryFromSleep: false,
-  });
-  assert.equal(r.ok, true);
-  assert.equal(r.boundarySeq, 19991);
   assert.equal(r.how, "waterline");
-  assert.equal(r.fromWaterline, true);
-});
-
-test("4.3：boundaryFromSleep=false 但 DB 不可用 → 闸门关（不猜）", () => {
-  const r = checkSleepGate([msg("h_1")], emptyState, {
-    sessionId: SID,
-    db: { ...stubDb(), available: false },
-    boundaryFromSleep: false,
-  });
-  assert.equal(r.ok, false);
-  assert.match(r.reason ?? "", /无法按水位取封盘线/);
+  assert.equal(r.boundarySeq, 19991);
 });

@@ -32,7 +32,7 @@ import type {
 } from "acp-kernel";
 import { loadConfigFile } from "./config.js";
 import { recordEviction } from "./evict-history.js";
-import { checkSleepGate, type SleepGateOpts } from "./sleep.js";
+import { checkSleepGate, ensureSleepMigration, type SleepGateOpts } from "./sleep.js";
 import { openEvictDb, type BlockSpanRow, type EvictDbView } from "./evict-db.js";
 
 export interface EvictFileSettings {
@@ -1113,19 +1113,13 @@ export function maybeEvict(
   // 补丁二：只读 DB 视图（index.db）。块的 seq、boundary 的 ref→seq 换算、
   // ref 对账、以及 2.6 的最小视图都从这里来。全程 query_only，失败优雅降级。
   const db = openEvictDb();
-  // 「开着驱逐的会话数」：白名单去掉 "*" 后的唯一 base 数。含 "*" 视为 >1
-  // （代表全部会话），老 sleep.json 缺 sessionId 时不能猜归属。
-  const evictingSessionCount = (() => {
-    const list = evict.sessions ?? [];
-    if (list.length === 0) return 1;
-    if (list.includes("*")) return 2;
-    return new Set(list.map((s) => s.split("|sub:")[0])).size;
-  })();
+  // 会话隔离·迁移：把旧全局 sleep.json 一次性复制到 per-session 目录
+  // （模块级只跑一次，状态只读端点不会触发，避免 GET 写文件）。
+  ensureSleepMigration(evict, log);
   const gateOpts: SleepGateOpts = {
     sleepFile: evict.sleepFile,
     sttRoot: evict.sttRoot,
     sessionId,
-    evictingSessionCount,
     db,
     boundaryFromSleep: evict.boundaryFromSleep,
   };
