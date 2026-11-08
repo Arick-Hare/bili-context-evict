@@ -5231,6 +5231,109 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
                 busy(cp, false);
             }
         });
+        // 补丁二 4.1/4.2/4.3/4.4：驱逐只读面板 + 两个按钮 + 两个配置项 +
+        // 深合并保存。所有 /__bili/* 端点都是 loopback-gated，与 config 页同源。
+        (function wireEvictPanel() {
+            const statusBox = $("evict-status-box");
+            const resultBox = $("evict-result-box");
+            const refreshBtn = $("evict-refresh");
+            const nowBtn = $("evict-now");
+            const previewBtn = $("evict-preview");
+            const saveBtn = $("evict-save-config");
+            const saveNote = $("evict-save-note");
+            const fromSleep = $("evict-boundary-from-sleep");
+            const seqCheck = $("evict-seq-ref-check");
+            if (!statusBox) return;
+
+            const fmtPct = (v) => (typeof v === "number" && isFinite(v) ? (v * 100).toFixed(1) + "%" : "—");
+            const fmtNum = (v) => (typeof v === "number" ? v.toLocaleString() : "—");
+            function renderStatus(s) {
+                if (!s || s.ok === false) {
+                    statusBox.textContent = "驱逐状态不可用：" + ((s && s.error) || "无响应");
+                    return;
+                }
+                const cfg = s.config || {};
+                const mk = s.marker || {};
+                const lines = [];
+                lines.push("index.db 只读视图：" + (s.dbAvailable ? "可用" : "不可用（块候选/查库回落会关闭）"));
+                lines.push("驱逐：" + (cfg.enabled ? "开" : "关") + "  budget=" + fmtPct(cfg.budget) + "  target=" + fmtPct(cfg.target) + "  dryRun=" + (cfg.dryRun ? "true" : "false"));
+                lines.push("配置：boundaryFromSleep=" + (cfg.boundaryFromSleep === false ? "false（按水位）" : "true") + "  seqRefCheck=" + (cfg.seqRefCheck || "strict"));
+                lines.push("sleep.json：sessionId=" + (mk.sessionId || "缺（老文件）") + "  boundary=" + (mk.boundary || "—") + "  boundarySeq=" + (mk.boundarySeq ?? "—") + "  at=" + (mk.at || "—"));
+                const last = s.lastEviction;
+                lines.push("上次驱逐：" + (last
+                    ? (last.at || "—") + " · " + (last.trigger || "—") + " · 扔 " + (last.evictedCount ?? 0)
+                        + " · 回收 " + fmtNum(last.reclaimedTokens) + " tok · " + fmtPct(last.beforeRatio) + " → " + fmtPct(last.afterRatio)
+                    : "无记录"));
+                for (const row of (s.sessions || [])) {
+                    lines.push("");
+                    lines.push("会话 " + row.id + (row.loaded ? "" : "（未加载）"));
+                    lines.push("  消息条数=" + fmtNum(row.messageCount) + "  contextTokens=" + fmtNum(row.contextTokens));
+                    lines.push("  睡眠闸门：" + (row.gateOpen ? "开" : "关") + (row.gateReason ? "  reason=" + row.gateReason : "") + (row.gateHow ? "  how=" + row.gateHow : ""));
+                    lines.push("  boundary=" + (row.boundary || "—") + "  seq=" + (row.boundarySeq ?? "—") + "  来源=" + (row.boundarySource || "—"));
+                    if (row.migrationWarning) lines.push("  ⚠ " + row.migrationWarning);
+                }
+                statusBox.textContent = lines.join("\n");
+                if (fromSleep) fromSleep.checked = cfg.boundaryFromSleep !== false;
+                if (seqCheck) seqCheck.value = cfg.seqRefCheck || "strict";
+            }
+            async function refreshStatus() {
+                try { renderStatus(await json(API_ROOT + "/evict-status")); }
+                catch (e) { statusBox.textContent = "状态读取失败：" + e.message; }
+            }
+            async function runEviction(dryRun) {
+                const btn = dryRun ? previewBtn : nowBtn;
+                if (!btn) return;
+                busy(btn, true);
+                try {
+                    const body = dryRun ? { dryRun: true } : {};
+                    const r = await json(API_ROOT + "/evict-now", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+                    const lines = [];
+                    lines.push(dryRun ? "【dryRun，未写回】" : "【已执行】");
+                    for (const it of (r && r.results) || []) {
+                        lines.push("· " + it.id + "  evictedCount=" + (it.evictedCount ?? 0) + "  reclaimedTokens=" + fmtNum(it.reclaimedTokens) + "  " + fmtPct(it.beforeRatio) + " → " + fmtPct(it.afterRatio));
+                        if (it.note) lines.push("  note: " + it.note);
+                        if (it.error) lines.push("  error: " + it.error);
+                        if (it.viewSource) lines.push("  视图来源: " + it.viewSource);
+                        const cs = it.blockCandidates || [];
+                        lines.push("  候选块 " + cs.length + " 个" + (cs.length ? "：" + cs.slice(0, 8).map((c) => c.id + "(" + c.chars + "字 seq " + c.startSeq + ".." + c.endSeq + ")").join("、") : ""));
+                    }
+                    if (resultBox) { resultBox.textContent = lines.join("\n"); resultBox.hidden = false; }
+                    refreshStatus();
+                } catch (e) {
+                    if (resultBox) { resultBox.textContent = "请求失败：" + e.message; resultBox.hidden = false; }
+                } finally { busy(btn, false); }
+            }
+            // 4.4 深合并：读整份 raw → 只改 evict 的两个键 → 用 whole-file PUT
+            // 写回。服务端 handleConfigPut 也会把未知键深合并回来，双保险。
+            async function saveEvictConfig() {
+                if (!saveBtn) return;
+                busy(saveBtn, true);
+                try {
+                    const cfg = await json(API_ROOT + "/config");
+                    const raw = typeof cfg.raw === "string" && cfg.raw.trim() ? cfg.raw : "{}";
+                    let obj;
+                    try { obj = JSON.parse(raw); } catch (e) { throw new Error("当前配置文件不是合法 JSON，拒绝保存：" + e.message); }
+                    if (!obj || typeof obj !== "object" || Array.isArray(obj)) obj = {};
+                    const oldEvict = obj.evict && typeof obj.evict === "object" && !Array.isArray(obj.evict) ? obj.evict : {};
+                    obj.evict = {
+                        ...oldEvict,
+                        boundaryFromSleep: fromSleep ? fromSleep.checked : true,
+                        seqRefCheck: seqCheck ? seqCheck.value : "strict",
+                    };
+                    await json(API_ROOT + "/config", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ file: JSON.stringify(obj, null, 2) }) });
+                    if (saveNote) saveNote.textContent = "已保存（深合并，其余键原样保留）";
+                    loadConfig();
+                    refreshStatus();
+                } catch (e) {
+                    if (saveNote) saveNote.textContent = "保存失败：" + e.message;
+                } finally { busy(saveBtn, false); }
+            }
+            if (refreshBtn) refreshBtn.addEventListener("click", refreshStatus);
+            if (nowBtn) nowBtn.addEventListener("click", () => runEviction(false));
+            if (previewBtn) previewBtn.addEventListener("click", () => runEviction(true));
+            if (saveBtn) saveBtn.addEventListener("click", saveEvictConfig);
+            refreshStatus();
+        })();
         document.addEventListener("click", (ev) => {
             const target = ev.target;
             if (!target || !target.closest) return;

@@ -364,8 +364,39 @@ export async function handleConfigPut(
         // #3666: dsh.* settings were removed — whole-file saves preserve any
         // leftover dsh keys verbatim (the load path warns once that they are
         // ignored), so there is nothing to validate or reconcile here.
+        //
+        // 补丁二 4.4：设置页保存必须**深合并**，禁止整份覆盖。web 客户端只会
+        // 提交它认识的字段；`evict.sttRoot` / `evict.coldStore` / 别人加的未知
+        // 键一旦被整份替换就会永久丢失（历史上「设置页保存吃掉 sttRoot」导致
+        // verifyArchive 当场找不到归档）。这里把磁盘原文件的键补回 next，
+        // evict 段做一层浅合并，保存后再回读校验键集合。
         try {
-            atomicWriteConfig(next);
+            const oldRaw = readConfig();
+            const merged: Record<string, unknown> = { ...oldRaw };
+            for (const [k, v] of Object.entries(next as Record<string, unknown>)) merged[k] = v;
+            const oldEvict = oldRaw.evict;
+            const nextEvict = (next as Record<string, unknown>).evict;
+            if (oldEvict && typeof oldEvict === "object" && !Array.isArray(oldEvict)) {
+                merged.evict = {
+                    ...(oldEvict as Record<string, unknown>),
+                    ...(nextEvict && typeof nextEvict === "object" && !Array.isArray(nextEvict)
+                        ? (nextEvict as Record<string, unknown>)
+                        : {}),
+                };
+            }
+            atomicWriteConfig(merged as ConfigShape);
+            // 回读对比键集合：少了的键写日志报警（不静默）。
+            const reread = readConfig();
+            const lost = Object.keys(oldRaw).filter((k) => !(k in reread));
+            if (lost.length > 0) {
+                log("warn", `[evict][config-merge] 保存后丢失顶层键：${lost.join(", ")}`);
+            }
+            const oldKeys = oldEvict && typeof oldEvict === "object" && !Array.isArray(oldEvict) ? Object.keys(oldEvict as Record<string, unknown>) : [];
+            const newEvict = reread.evict;
+            const lostEvict = oldKeys.filter((k) => !newEvict || typeof newEvict !== "object" || !(k in (newEvict as Record<string, unknown>)));
+            if (lostEvict.length > 0) {
+                log("warn", `[evict][config-merge] 保存后丢失 evict 键：${lostEvict.join(", ")}（检查 sttRoot/coldStore）`);
+            }
             onChanged?.();
         } catch (error) {
             return sendError(res, 500, `failed to apply config: ${String(error)}`);

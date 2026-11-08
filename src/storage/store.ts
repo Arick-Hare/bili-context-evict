@@ -1142,8 +1142,39 @@ export class UnifiedStore {
                 } catch { /* malformed payload: keep the no-claim sentinel */ }
                 return hi < 0 ? [-1, -1] : [lo, hi];
             };
+            // 补丁二 2.4：新写的块补齐 start_ref/end_ref。
+            // tier2/tier3 的块 plan 里常常不带 ref（b.startRef/endRef === null），
+            // 但 start_seq/end_seq 已经从 log 算出；按 (session_id, seq) 反查
+            // messages.ref_num 补齐即可。存量块不回填；start_seq = 0 的块允许
+            // start_ref = null（0 前面没有消息）；查不到写 null 并打日志。
+            // 只改 DB 投影列，不碰 payload_json / digest 一致性（finishPlan 不动）。
+            const refNumForSeq = (seq: number): number | null => {
+                if (!Number.isInteger(seq) || seq <= 0) return null;
+                try {
+                    const r = this.db
+                        .prepare("SELECT ref_num FROM messages WHERE session_id = ? AND seq = ? AND ref_num IS NOT NULL LIMIT 1")
+                        .get(s.sessionId, seq) as { ref_num?: unknown } | undefined;
+                    return typeof r?.ref_num === "number" && Number.isFinite(r.ref_num) ? r.ref_num : null;
+                } catch { return null; }
+            };
+            const bRefStats = { filled: 0, missing: 0 };
             for (const b of input.blocks) {
                 const [bStartSeq, bEndSeq] = boundsForCovered(b.payloadJson);
+                let bStartRef = b.startRef;
+                let bEndRef = b.endRef;
+                if (bStartRef === null || bStartRef === undefined) {
+                    bStartRef = refNumForSeq(bStartSeq);
+                    if (bStartRef !== null) bRefStats.filled++;
+                    else if (bStartSeq !== 0) bRefStats.missing++;
+                }
+                if (bEndRef === null || bEndRef === undefined) {
+                    bEndRef = refNumForSeq(bEndSeq);
+                    if (bEndRef !== null) bRefStats.filled++;
+                    else bRefStats.missing++;
+                }
+                if (bRefStats.missing > 0) {
+                    loggerLog("warn", `[evict][ref-backfill] ${s.sessionId} 块 ${b.blockId} 的 ref 未补齐（start_seq=${bStartSeq} end_seq=${bEndSeq}）；已写 null，累计 ${bRefStats.missing} 处`);
+                }
                 const summaryHash = this.putContent(b.summary);
                 const oneHash = b.one === null ? null : this.putContent(b.one);
                 // Re-ingest of the same block id replaces the row (dry-run
@@ -1194,8 +1225,8 @@ export class UnifiedStore {
                             b.ord,
                             bStartSeq,
                             bEndSeq,
-                            b.startRef,
-                            b.endRef,
+                            bStartRef,
+                            bEndRef,
                             b.tier,
                             summaryHash,
                             oneHash,
@@ -1234,8 +1265,8 @@ export class UnifiedStore {
                         b.ord,
                         bStartSeq,
                         bEndSeq,
-                        b.startRef,
-                        b.endRef,
+                        bStartRef,
+                        bEndRef,
                         b.tier,
                         summaryHash,
                         oneHash,

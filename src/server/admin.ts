@@ -26,8 +26,10 @@ import { dismissHostPlugin, visibleHostPluginNotices } from "../host-plugin-noti
 import { dismissedUpgradeNotices, dismissUpgradeNotice, PCK_NOTICE_ID, pckNoticeActive, WM_FASTPATH_INTRO_ID } from "../pck-notice.js";
 import { featureOverrideAbsent } from "../rollout.js";
 import { listSessions, memoryReport, peekSession, splitSessionWarnings, totalInFlight, getSession, markDirty } from "../session.js";
-import { maybeEvict, resolveEvictConfig, lastRequestSnapshot } from "../evict.js";
+import { maybeEvict, resolveEvictConfig, lastRequestSnapshot, collectBlockCandidatesDetailed, type EvictConfig } from "../evict.js";
 import { readEvictionHistory, recordEviction } from "../evict-history.js";
+import { checkSleepGate, resolveBoundarySeq, readSleepMarker, sleepFilePath, boundaryRefNum } from "../sleep.js";
+import { openEvictDb, type EvictDbView } from "../evict-db.js";
 import { BILI_TUNNEL_HEADER } from "../tunnel-guard.js";
 import { isLoopbackAddress } from "../util.js";
 import { clearUpstreamAlertsForHost, getUpstreamAlerts, getUpstreamHealthReport } from "../upstream-alerts.js";
@@ -199,13 +201,86 @@ function auxProxyShot(opts: ProxyOptions): { proxy: string | null; source: strin
  *  白名单里的每个会话，用「最近一次真实请求」的原始消息快照 + 压缩 state
  *  执行一次 `maybeEvict`，真驱逐后写回 state/lastMessages 并 markDirty。
  *  不依赖 round 循环——直接由 HTTP 请求驱动，作为自动触发失效时的手动后门。 */
+/** 4.2「看一眼候选」：算当前封盘线 seq（与 maybeEvict 的闸门同一套解析）。 */
+function previewBoundarySeq(sessionId: string, evict: EvictConfig, db: EvictDbView): number | null {
+    if (evict.boundaryFromSleep === false) {
+        return db.available ? db.maxSeq(sessionId) : null;
+    }
+    const marker = readSleepMarker(sleepFilePath(evict.sleepFile));
+    if (!marker) return null;
+    if (marker.sessionId && marker.sessionId !== sessionId) return null;
+    const n = (evict.sessions ?? []).includes("*")
+        ? 2
+        : new Set((evict.sessions ?? []).map((s) => s.split("|sub:")[0])).size;
+    const r = resolveBoundarySeq(marker, { sessionId, evictingSessionCount: n, db });
+    return r.ok ? r.seq ?? null : null;
+}
+
+/** 4.1 只读状态：睡眠闸门 / boundary / 上次驱逐 / 会话上下文，原样显示 reason。 */
+function buildEvictStatus(): Record<string, unknown> {
+    const evict = resolveEvictConfig(loadConfigFile().evict, process.env);
+    const db = openEvictDb();
+    const sessions = (evict.sessions ?? []).map((s) => s.split("|sub:")[0]);
+    const n = sessions.includes("*") ? 2 : new Set(sessions).size;
+    const marker = readSleepMarker(sleepFilePath(evict.sleepFile));
+    const history = readEvictionHistory(1)[0] as unknown as Record<string, unknown> | undefined;
+    const perSession = [...new Set(sessions.filter((s) => s !== "*"))].map((sid) => {
+        const session = getSession(sid);
+        const gate = session
+            ? checkSleepGate(session.lastMessages ?? [], session.state, {
+                sleepFile: evict.sleepFile,
+                sttRoot: evict.sttRoot,
+                sessionId: sid,
+                evictingSessionCount: n,
+                db,
+                boundaryFromSleep: evict.boundaryFromSleep,
+            })
+            : null;
+        return {
+            id: sid,
+            loaded: !!session,
+            messageCount: session?.lastMessages?.length ?? 0,
+            contextTokens: session?.stats?.contextTokens ?? null,
+            gateOpen: gate?.ok ?? false,
+            // 原样显示 reason，不吞成「未知错误」。
+            gateReason: gate?.reason ?? null,
+            gateHow: gate?.how ?? null,
+            boundary: gate?.marker?.boundary ?? marker?.boundary ?? null,
+            boundarySeq: gate?.boundarySeq ?? marker?.boundarySeq ?? null,
+            boundaryAt: gate?.marker?.at ?? marker?.at ?? null,
+            boundarySource: gate?.fromWaterline ? "waterline" : marker ? "sleep.json" : null,
+            archived: gate?.marker?.archived ?? marker?.archived ?? null,
+            migrationWarning: gate?.migrationWarning ?? null,
+        };
+    });
+    return {
+        ok: true,
+        dbAvailable: db.available,
+        config: {
+            enabled: evict.enabled, budget: evict.budget, target: evict.target,
+            dryRun: evict.dryRun, boundaryFromSleep: evict.boundaryFromSleep,
+            seqRefCheck: evict.seqRefCheck, sessions: evict.sessions ?? [],
+        },
+        marker: marker ? {
+            sessionId: marker.sessionId ?? null, boundary: marker.boundary ?? null,
+            boundarySeq: marker.boundarySeq ?? null, at: marker.at ?? null,
+            archived: marker.archived ?? null,
+        } : null,
+        sessions: perSession,
+        lastEviction: history ?? null,
+    };
+}
+
 async function handleEvictNow(
     res: http.ServerResponse,
     core: CompressionCore,
     config: Config,
     log: (level: string, msg: string) => void,
+    /** 4.2「看一眼候选」：只跑 dryRun，不写回、不记录。 */
+    dryRunOverride?: boolean,
 ): Promise<void> {
-    const evict = resolveEvictConfig(loadConfigFile().evict, process.env);
+    const baseEvict = resolveEvictConfig(loadConfigFile().evict, process.env);
+    const evict = dryRunOverride === undefined ? baseEvict : { ...baseEvict, dryRun: dryRunOverride };
     const sessions = evict.sessions ?? [];
     log("info", `[evict-manual] 手动驱逐：enabled=${evict.enabled} budget=${evict.budget} target=${evict.target} dryRun=${evict.dryRun} sessions=${JSON.stringify(sessions)}`);
     const results: Array<Record<string, unknown>> = [];
@@ -216,21 +291,38 @@ async function handleEvictNow(
     const targets = allLive
         ? liveBases
         : [...new Set(sessions.map((s) => s.split("|sub:")[0]))];
+    const db = openEvictDb();
     for (const base of targets) {
         try {
             const session = getSession(base);
             const snapshot = lastRequestSnapshot(session);
-            const messages = snapshot?.messages ?? session.lastMessages ?? [];
+            let messages = snapshot?.messages ?? session.lastMessages ?? [];
+            let viewSource: "snapshot" | "lastMessages" | "db-minimal" = snapshot ? "snapshot" : "lastMessages";
+            // 2.6 兜底：重启后 snapshot 与 lastMessages 都可能为空。从 index.db
+            // 取「boundarySeq 之后的消息 + active 块 summary 占位」组最小视图。
+            // 仍然为空才跳过，reason 写明是哪一步缺的。
+            if (messages.length === 0) {
+                const marker = readSleepMarker(sleepFilePath(evict.sleepFile));
+                const seqHint = typeof marker?.boundarySeq === "number" ? marker.boundarySeq : 0;
+                const minimal = db.available ? db.minimalView(base, seqHint, session.state) : null;
+                if (minimal && minimal.length > 0) {
+                    messages = minimal;
+                    viewSource = "db-minimal";
+                    log("info", `[evict-manual][${base}] snapshot/lastMessages 为空，已从 index.db 组最小视图（${minimal.length} 条）`);
+                }
+            }
             const beforeTokens = snapshot ? snapshot.tokens : session.stats.contextTokens;
             const tokensSource = snapshot ? "snapshot" as const : "stats" as const;
             const snapshotAgeMs = snapshot?.at ? Date.now() - snapshot.at : null;
             if (messages.length === 0) {
-                const note = "no lastMessages snapshot";
-                recordEviction({
-                    trigger: "manual", sessionId: base, evictedCount: 0, reclaimedTokens: 0,
-                    beforeRatio: null, afterRatio: null, dryRun: evict.dryRun, reason: note,
-                    tokensSource, snapshotAgeMs,
-                });
+                const note = `no lastMessages snapshot，且 index.db 最小视图也为空（db.available=${db.available}，sessionId=${base}）`;
+                if (!evict.dryRun) {
+                    recordEviction({
+                        trigger: "manual", sessionId: base, evictedCount: 0, reclaimedTokens: 0,
+                        beforeRatio: null, afterRatio: null, dryRun: evict.dryRun, reason: note,
+                        tokensSource, snapshotAgeMs,
+                    });
+                }
                 results.push({ id: base, evictedCount: 0, note });
                 continue;
             }
@@ -246,29 +338,61 @@ async function handleEvictNow(
                 (m) => log("info", `[evict-manual][${base}] ${m}`),
                 sessionLimit, trace, base,
             );
+            // 4.2「看一眼候选」：列会扔哪几个块、多少字。dryRun 不写回、不记录。
+            const blockPreview = collectBlockCandidatesDetailed(
+                session.state,
+                previewBoundarySeq(base, evict, db),
+                new Set<string>(),
+                Math.max(1, Math.floor(evict.minToolResultChars ?? 200)),
+                {
+                    spans: db.available ? db.blockSpans(base) : null,
+                    messageSeqByRef: db.available ? db.messageSeqByRef(base) : null,
+                    refForSeq: db.available
+                        ? (seq) => {
+                            const n = db.refNumForSeq(base, seq);
+                            return n === null ? null : `m${n}`;
+                        }
+                        : undefined,
+                    seqRefCheck: evict.seqRefCheck,
+                },
+            ).units.map((u) => ({ id: u.blockId, chars: u.summaryChars, startSeq: u.startSeq, endSeq: u.endSeq }));
             if (evicted) {
-                session.state = evicted.state;
-                if (!(session as { lastMessagesFolded?: boolean }).lastMessagesFolded) session.lastMessages = evicted.messages;
-                markDirty(session);
+                if (!evict.dryRun) {
+                    // 2.6 的最小视图只是给 maybeEvict 定位用，绝不能写回成
+                    // session.lastMessages（那会把真实视图替换成占位符）。
+                    session.state = evicted.state;
+                    if (viewSource !== "db-minimal" && !(session as { lastMessagesFolded?: boolean }).lastMessagesFolded) {
+                        session.lastMessages = evicted.messages;
+                    }
+                    markDirty(session);
+                }
                 const afterRatio = limit > 0 ? Math.max(0, beforeTokens - evicted.reclaimedTokens) / limit : null;
-                recordEviction({
-                    trigger: "manual", sessionId: base,
-                    evictedCount: evicted.evictedCount, reclaimedTokens: evicted.reclaimedTokens,
-                    beforeRatio, afterRatio, dryRun: evict.dryRun, reason: "",
-                    tokensSource, snapshotAgeMs,
-                });
+                if (!evict.dryRun) {
+                    recordEviction({
+                        trigger: "manual", sessionId: base,
+                        evictedCount: evicted.evictedCount, reclaimedTokens: evicted.reclaimedTokens,
+                        beforeRatio, afterRatio, dryRun: evict.dryRun, reason: "",
+                        tokensSource, snapshotAgeMs,
+                    });
+                }
                 results.push({
                     id: base, evictedCount: evicted.evictedCount,
                     reclaimedTokens: evicted.reclaimedTokens, beforeRatio, afterRatio,
+                    dryRun: evict.dryRun, viewSource, blockCandidates: blockPreview,
                 });
             } else {
                 const reason = trace.reason ?? "没有可驱逐的内容";
-                recordEviction({
-                    trigger: "manual", sessionId: base, evictedCount: 0, reclaimedTokens: 0,
-                    beforeRatio, afterRatio: beforeRatio, dryRun: evict.dryRun, reason,
-                    tokensSource, snapshotAgeMs,
+                if (!evict.dryRun) {
+                    recordEviction({
+                        trigger: "manual", sessionId: base, evictedCount: 0, reclaimedTokens: 0,
+                        beforeRatio, afterRatio: beforeRatio, dryRun: evict.dryRun, reason,
+                        tokensSource, snapshotAgeMs,
+                    });
+                }
+                results.push({
+                    id: base, evictedCount: 0, beforeRatio, afterRatio: beforeRatio,
+                    dryRun: evict.dryRun, viewSource, blockCandidates: blockPreview, note: reason,
                 });
-                results.push({ id: base, evictedCount: 0, beforeRatio, afterRatio: beforeRatio, note: reason });
             }
         } catch (e) {
             const reason = String(e);
@@ -351,8 +475,32 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         res.end(JSON.stringify({ ok: true, entries: readEvictionHistory(limit) }));
         return;
     }
+    // 补丁二 4.1：只读状态（会话 / 闸门 reason / boundary / 上次驱逐）。
+    if (req.method === "GET" && (req.url ?? "").startsWith("/__bili/evict-status")) {
+        try {
+            res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
+            res.end(JSON.stringify(buildEvictStatus()));
+        } catch (e) {
+            res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
+            res.end(JSON.stringify({ ok: false, error: String(e) }));
+        }
+        return;
+    }
     // 手动驱逐：POST /__bili/evict-now → 对白名单会话立即执行一次驱逐。
-    if (req.method === "POST" && req.url === "/__bili/evict-now") return handleEvictNow(res, core, config, log);
+    // body {"dryRun":true} 或 ?dryRun=1 → 4.2「看一眼候选」，只观察不写回。
+    if (req.method === "POST" && (req.url ?? "").startsWith("/__bili/evict-now")) {
+        let wantDryRun: boolean | undefined;
+        const q = new URL(req.url ?? "/__bili/evict-now", "http://localhost").searchParams;
+        if (q.get("dryRun") === "1" || q.get("dryRun") === "true") wantDryRun = true;
+        try {
+            const raw = (await readBody(req)).toString("utf8");
+            if (raw) {
+                const b = JSON.parse(raw) as { dryRun?: unknown };
+                if (typeof b.dryRun === "boolean") wantDryRun = b.dryRun;
+            }
+        } catch { /* 无 body / 非法 JSON 按配置默认 */ }
+        return handleEvictNow(res, core, config, log, wantDryRun);
+    }
     if (req.method === "GET" && (req.url === "/__bili/sessions" || req.url?.startsWith("/__bili/sessions?"))) return sendWebSessions(res, req);
     if (req.method === "GET" && req.url?.startsWith("/__bili/logs")) return sendWebLogs(res, req);
     if (req.method === "GET" && req.url?.startsWith("/__bili/diagnostics")) return sendDiagnostics(res, req.url);

@@ -109,6 +109,24 @@ export function renderPage(origin: string, version: string, embed = false, theme
 <div class="cfg-dirty-note small" style="margin-top:10px;color:#9a6700" hidden><span data-i18n="cfg.unsaved">${zh("cfg.unsaved")}</span></div>
 <div style="margin-top:10px"><button id="save-pricing" class="btn"><span data-i18n="cfg.save">${zh("cfg.save")}</span></button></div>
 </div></div>
+<div class="card" id="card-evict"><div class="card-h"><span>驱逐状态 / 手动驱逐</span></div><div class="card-b">
+<p class="dim small" style="margin:0 0 12px">只读显示睡眠闸门与 boundary；两个按钮直接调用 /__bili/evict-now。「看一眼候选」只跑 dryRun，不写回。保存配置走深合并，未知字段（sttRoot / coldStore 等）原样保留。</p>
+<div id="evict-status-box" class="mono small" style="white-space:pre-wrap;line-height:1.7;color:var(--dim,#888)">加载中…</div>
+<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px">
+<button id="evict-refresh" class="btn sm">刷新状态</button>
+<button id="evict-now" class="btn sm">立即驱逐</button>
+<button id="evict-preview" class="btn sm">看一眼候选（dryRun）</button>
+</div>
+<div id="evict-result-box" class="mono small" style="white-space:pre-wrap;line-height:1.7;margin-top:10px" hidden></div>
+<div style="display:flex;flex-direction:column;gap:8px;margin-top:14px;padding-top:12px;border-top:1px solid rgba(127,127,127,.25)">
+<label style="display:flex;align-items:center;gap:8px;font-size:13px"><input type="checkbox" id="evict-boundary-from-sleep" checked> <span>boundaryFromSleep：从 sleep.json 取封盘线（关掉则忽略 sleep.json，只按水位触发）</span></label>
+<label style="display:flex;align-items:center;gap:8px;font-size:13px">seqRefCheck：
+<select id="evict-seq-ref-check" class="field-input" style="width:auto;min-width:110px"><option value="strict">strict（默认）</option><option value="warn">warn</option><option value="off">off</option></select>
+</label>
+<button id="evict-save-config" class="btn sm" style="align-self:flex-start">保存驱逐配置（深合并）</button>
+<span id="evict-save-note" class="dim small"></span>
+</div>
+</div></div>
 <div class="card" id="card-file"><div class="card-h"><span data-i18n="cfg.file">${zh("cfg.file")}</span></div><div class="card-b">
 <p class="dim small" style="margin:0 0 8px" data-i18n="cfg.file_desc">${zh("cfg.file_desc")}</p>
 <dl class="kv"><div class="k" data-i18n="dt.config_file">${zh("dt.config_file")}</div><div class="v" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><span id="cfg-path" class="mono dim small"></span><button id="copy-cfg-file" class="btn sm copy-btn" data-copy=""><span data-i18n="common.copy">${zh("common.copy")}</span></button></div></dl>

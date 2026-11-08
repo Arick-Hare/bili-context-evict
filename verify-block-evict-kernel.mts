@@ -119,7 +119,7 @@ test("prune 后旧长摘要消失、只剩 evicted 标记（视图真的变小�
 });
 
 test("不会重复扔：新块已是 evicted 标记，旧块 inactive 不再被 collectBlockCandidates 选中", async () => {
-  const { collectBlockCandidates, refNumber } = await import("./src/evict.js");
+  const { collectBlockCandidates } = await import("./src/evict.js");
   const { messages, state, startRef, endRef } = setup();
   const old = state.blocks.find((b) => b.active)!;
   const trial = deactivateBlock(state, [old.blockId]);
@@ -131,12 +131,20 @@ test("不会重复扔：新块已是 evicted 标记，旧块 inactive 不再被 
     config,
     protectedMessageIds: new Set<string>(),
   });
-  // 补丁一新签名：boundary 用 ref 数值（放到很大，所有块都算已封盘）
+  // 补丁二：seq 当裁判。给每个块一份 DB span stub（boundarySeq 放到很大，
+  // 所有块都算已封盘），验证幂等来自 active / 标记本身，而不是 DB 不可用。
+  const spans = new Map(
+    res.state.blocks.map((b, i) => [b.blockId, {
+      blockId: b.blockId, startSeq: i * 10, endSeq: i * 10 + 5,
+      startRefNum: null, endRefNum: null, active: b.active, ord: i,
+    }]),
+  );
   const units = collectBlockCandidates(
     res.state,
-    Math.max(...res.state.blocks.map((b) => refNumber(b.endRef) ?? 0)) + 1000,
+    100000,
     new Set<string>(),
     200,
+    { spans, seqRefCheck: "off" },
   );
   assert.equal(units.length, 0, "旧块 inactive + 新块是标记，都不该再进候选");
 });
