@@ -1,7 +1,7 @@
 {
-  "name": "billion-context",
-  "version": "0.1.212",
-  "description": "A context-compression plugin \u2014 small context windows (a 100K context is enough), 5x fewer tokens, month-long single sessions (billions of tokens), and compression quality \u2014 for all agents: pi, OpenCode, Codex, Claude Code, and more. billion-context is all you need.",
+  "name": "bili-context-evict",
+  "version": "0.1.212-fork.1",
+  "description": "Context compression + tool-result trimming + sleep-gated block eviction. A standalone fork of billion-context v0.1.212; does not depend on any external memory system.",
   "type": "module",
   "main": "dist/index.js",
   "exports": {
@@ -14,8 +14,8 @@
     "./client": "./dist/agent/dsh-native-client.js"
   },
   "bin": {
-    "bili": "./dist/index.js",
-    "bili-proxy": "./dist/index.js"
+    "bili-evict": "./dist/index.js",
+    "bili-evict-proxy": "./dist/index.js"
   },
   "scripts": {
     "build": "npm --prefix kernel run build && npm --prefix pi-subagents run build && tsup && node scripts/write-build-info.mjs && node scripts/check-dist-import-annotations.mjs && node scripts/check-dist-external.mjs",
@@ -54,11 +54,11 @@
   "author": "ranxianglei",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/ranxianglei/billion-context.git"
+    "url": "git+https://github.com/Arick-Hare/bili-context-evict.git"
   },
-  "homepage": "https://github.com/ranxianglei/billion-context#readme",
+  "homepage": "https://github.com/Arick-Hare/bili-context-evict#readme",
   "bugs": {
-    "url": "https://github.com/ranxianglei/billion-context/issues"
+    "url": "https://github.com/Arick-Hare/bili-context-evict/issues"
   },
   "dependencies": {
     "mysql2": "^3.15.3",
@@ -98,6 +98,7 @@
   "files": [
     "LICENSE",
     "README.md",
+    "EVICT.md",
     "CONFIGURATION.md",
     "CONFIGURATION.zh-CN.md",
     "dist",

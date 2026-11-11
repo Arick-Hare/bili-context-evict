@@ -5,6 +5,7 @@ import { anthropicToCore, buildSystem, coreToAnthropic, extractSystem, type Anth
 import { rewriteInboundThreadContinue } from "./thread-tracking.js";
 import { captureThreadsTurn, estimateThreadsTokens, isThreadsBody, threadsReforgeEnabled } from "./threads-lane.js";
 import type { CompressReasoningConfig } from "../reasoning-drop.js";
+import { resolveTextSanitize, guardCoreMessages, guardWireMessages } from "../text-sanitize.js";
 import type { ProxyOptions } from "../config.js";
 import { pluginAgentHeader } from "../plugin.js";
 import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, makeFoldPointReasoningDroppable, planReasoningDrop, reapOrphansLogged, runNudgeDecision, stripKernelSummaries, warnAnthropicThinkingPairs, type Prepared } from "../server.js";
@@ -393,9 +394,8 @@ export async function prepareAnthropic(
         // steers the model into an atomically-refused compress call.
         if (turn.nudge) turn.nudge.compressibleRanges = filterDeadRanges(session, excludeDeadRefRanges(viableRanges(turn.nudge.compressibleRanges), session.state.deadRefs));
         nudge = turn.nudge;
-        // 自动驱逐：DSH 的真实请求走这条 lane（loop/core.ts 的 ACP 回合循环
-        // 在这套部署里根本不跑）。驱逐成功时本轮不再发 nudge —— 可压缩范围
-        // 可能已经被整块折叠掉了。
+        // 自动驱逐：真实请求走这条 lane（不经过 loop/core.ts 的 ACP 回合循环）。
+        // 驱逐成功时本轮不再发 nudge —— 可压缩范围可能已经被整块折叠掉了。
         const evictedTurn = autoEvictTurn(
             core,
             sessionId,
@@ -452,7 +452,7 @@ export async function prepareAnthropic(
             modelWantsIt: turn.nudge !== undefined && (turn.nudge.shouldInject || emergencyNudgeArmed(session, turn.nudge, loopConfig.compress.minCompressRange, tokenCount, loopConfig.nudge.growthFloor)),
         });
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, resolvedModel ?? parsed.model, willInjectNudge, decideTier1Arm && !decideFallbackOverride, surfaceOffDetail(laneDecisions, opts.compress.injectTool)));
-        processedMessages = applyReasoningDrop(stripKernelSummaries(turn.messages, turn.state), reasoningPlan, log, sessionId);
+        processedMessages = guardCoreMessages(applyReasoningDrop(stripKernelSummaries(turn.messages, turn.state), reasoningPlan, log, sessionId), resolveTextSanitize(), log, sessionId);
         // #1001: a silent client history rewrite takes the same archive+prune path
         // as an announced /compact boundary — syncBlocks above has already
         // deactivated the blocks whose sources left the context. Skipped when
@@ -620,6 +620,9 @@ export async function prepareAnthropic(
     markDirty(session);
 
     const rebuilt: AnthropicRequestBody = { ...parsed, messages: rebuiltMessages, system: systemOut, tools: toolsOut };
+    // 正文三道闸：最后一道出站兜底。只改发给模型的视图，
+    // 存盘（snapshotMessages(originalMessages)）与 content_hash 一字不动。
+    guardWireMessages(rebuilt.messages, resolveTextSanitize(), log, sessionId);
     warnAnthropicThinkingPairs(parsed.messages, rebuiltMessages, log, sessionId);
     // prompt_cache_key is the omp plugin's session id stamped for the proxy's
     // identity chain (#268), not part of the Anthropic Messages API — strip it
@@ -651,7 +654,7 @@ export async function prepareAnthropic(
     // main-scale tiebreak sees this request's own upper bound.
     probeRequestMembership(session, collectRequestIds(incomingMsgIds, originalMessages), session.stats.localInputEstimate ?? 0);
     if (upstreamOrigin) session.stats.lastLocalTextEstimateOrigin = upstreamOrigin;
-    return { body: JSON.stringify(rebuilt), parsedBody: rebuilt, session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, judgeBaseline, anthropicSystem: parsed.system, anthropicBillingBlock, anthropicCacheMarks, anthropicClientCacheControls: clientCacheControls, systemNotes: sysNotes, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, mcpDialectNote: laneDecisions.mcpDialect, nudge, nudgeOutcome, prompts, surface, renderTags: renderStrategy, dropReasoning: (msgs: BiliMessage[]) => applyReasoningDrop(msgs, reasoningPlan, log, sessionId) } as Prepared;
+    return { body: JSON.stringify(rebuilt), parsedBody: rebuilt, session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, judgeBaseline, anthropicSystem: parsed.system, anthropicBillingBlock, anthropicCacheMarks, anthropicClientCacheControls: clientCacheControls, systemNotes: sysNotes, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, mcpDialectNote: laneDecisions.mcpDialect, nudge, nudgeOutcome, prompts, surface, renderTags: renderStrategy, dropReasoning: (msgs: BiliMessage[]) => guardCoreMessages(applyReasoningDrop(msgs, reasoningPlan, log, sessionId), resolveTextSanitize(), log, sessionId) } as Prepared;
 }
 
 // #2648: true when any system block pins cache_control.scope:"global". bili's

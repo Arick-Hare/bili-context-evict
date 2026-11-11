@@ -3446,9 +3446,9 @@ export function prepareCodexHome(opts: {
  *  plugin is injected even when the user has no custom providers (pure
  *  built-in deepseek route). Returns the patch file path (undefined when it
  *  could not be written — dsh then just boots without the plugin). */
-const DSH_BARE_ENTRY = "billion-context";
+const DSH_BARE_ENTRY = "bili-context-evict";
 
-/** #1590: shim package making the bare `billion-context` root resolvable from the two
+/** #1590: shim package making the bare `bili-context-evict` root resolvable from the two
  *  anchors dsh uses at runtime, without touching dsh's own tree:
  *  - the ESM host import is anchored at the active PROFILE dir, whose walk-up
  *    reaches <DSH_HOME>/node_modules (every profile lives under DSH_HOME);
@@ -3471,7 +3471,7 @@ export function writeDshClientShimFiles(shimDir: string, hostBundle: string, cli
         fs.writeFileSync(
             path.join(shimDir, "package.json"),
             `${JSON.stringify({
-                name: "billion-context",
+                name: "bili-context-evict",
                 version,
                 type: "module",
                 exports: exportsMap,
@@ -3498,11 +3498,11 @@ export function writeDshClientShim(dshHome: string): boolean {
     try {
         version = JSON.parse(fs.readFileSync(path.join(selfPackageRoot(), "package.json"), "utf8")).version ?? version;
     } catch {}
-    return writeDshClientShimFiles(path.join(dshHome, "node_modules", "billion-context"), hostBundle, clientBundle, version, selfDistFile("agent/dsh-compaction-gate.js"));
+    return writeDshClientShimFiles(path.join(dshHome, "node_modules", DSH_BARE_ENTRY), hostBundle, clientBundle, version, selfDistFile("agent/dsh-compaction-gate.js"));
 }
 
 /** #1590: entry name for the launcher's --patch overlay. The BARE package
- *  specifier "billion-context" (package root — never a subpath: dsh's client
+ *  specifier "bili-context-evict" (package root — never a subpath: dsh's client
  *  scanner drops subpath entry names in exactPackageSpecifier) lets dsh load
  *  the host half AND its client scanner attach the browser half (the "bili设置"
  *  settings entry) — but only when the package root import lands on the dsh
@@ -6240,7 +6240,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
             throw new Error(
                 "bili: pi needs provider URL rewrites but the bili extension cannot load " +
                     "(dist/agent/pi.js missing and the plugin is not installed in ~/.pi/agent/settings.json) — " +
-                    "reinstall billion-context or run `bili plugin install pi`",
+                    "reinstall bili-context-evict or run `bili plugin install pi`",
             );
         }
     }
@@ -6340,7 +6340,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
             throw new Error(
                 "bili: omp needs provider URL rewrites but the bili extension cannot load " +
                     "(dist/agent/omp.js missing and the plugin is not installed in ~/.omp/agent/config.yml) — " +
-                    "reinstall billion-context or run `bili plugin install omp`",
+                    "reinstall bili-context-evict or run `bili plugin install omp`",
             );
         }
     }

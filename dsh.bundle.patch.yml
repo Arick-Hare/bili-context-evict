@@ -1,6 +1,6 @@
-# billion-context dsh bundle layer (#949).
-# Mounted automatically when the profile's package.json lists billion-context
-# in dsh.profile.bundles (`dsh plugin --profile <name> add billion-context`);
+# bili-context-evict dsh bundle layer (forked from billion-context #949).
+# Mounted automatically when the profile's package.json lists bili-context-evict
+# in dsh.profile.bundles (`dsh plugin --profile <name> add bili-context-evict`);
 # the loader resolves `name` from the profile's node_modules.
 # #1772/#2474/#3354: the `auto: false` below targets the HOST-PLANE
 # compaction-basic row. In profiles bundling @deepseek-ai/dsh-web-app that row
@@ -16,13 +16,13 @@
 # the presets fall back to STOCK dsh compaction instead of pending forever
 # (the old wiring bricked session creation on exactly that path). Do NOT
 # disable the bili-compaction-gate entry itself: it carries the service the
-# presets wait on; to uninstall, remove billion-context from
+# presets wait on; to uninstall, remove bili-context-evict from
 # dsh.profile.bundles instead.
 - insert:
     - id: bili-native
-      name: billion-context
+      name: bili-context-evict
     - id: bili-compaction-gate
-      name: billion-context/dsh-compaction-gate
+      name: bili-context-evict/dsh-compaction-gate
 - id: compaction-basic
   config:
     auto: false

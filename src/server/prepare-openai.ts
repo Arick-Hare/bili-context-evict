@@ -3,6 +3,7 @@ import type { CompressionCore, Config, CoreMessage, NudgeDecision, PackSurface, 
 import { isRenderedSummaryMessage, renderNudgeText, viableRanges } from "acp-kernel";
 import { coreToOpenai, injectOpenaiSystem, openaiToCore, type BiliMessage, type OpenAIRequestBody, type OpenAITool } from "acp-kernel/wire";
 import type { CompressReasoningConfig } from "../reasoning-drop.js";
+import { resolveTextSanitize, guardCoreMessages, guardWireMessages } from "../text-sanitize.js";
 import type { ProxyOptions } from "../config.js";
 import { effectivePromptCacheRouting } from "../config.js";
 import { currentCalibrationFactor, hardenOpenaiAssistantContent, systemToUser } from "../util.js";
@@ -289,9 +290,8 @@ export async function prepareOpenai(
         // steers the model into an atomically-refused compress call.
         if (turn.nudge) turn.nudge.compressibleRanges = filterDeadRanges(session, excludeDeadRefRanges(viableRanges(turn.nudge.compressibleRanges), session.state.deadRefs));
         nudge = turn.nudge;
-        // 自动驱逐：DSH 的真实请求走这条 lane（loop/core.ts 的 ACP 回合循环
-        // 在这套部署里根本不跑）。驱逐成功时本轮不再发 nudge —— 可压缩范围
-        // 可能已经被整块折叠掉了。
+        // 自动驱逐：真实请求走这条 lane（不经过 loop/core.ts 的 ACP 回合循环）。
+        // 驱逐成功时本轮不再发 nudge —— 可压缩范围可能已经被整块折叠掉了。
         const evictedTurn = autoEvictTurn(
             core,
             sessionId,
@@ -352,7 +352,7 @@ export async function prepareOpenai(
             modelWantsIt: turn.nudge !== undefined && (turn.nudge.shouldInject || emergencyNudgeArmed(session, turn.nudge, loopConfig.compress.minCompressRange, tokenCount, loopConfig.nudge.growthFloor)),
         });
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge, decideTier1Arm && !decideFallbackOverride, surfaceOffDetail(laneDecisions, opts.compress.injectTool)));
-        processedMessages = applyReasoningDrop(stripKernelSummaries(turn.messages, turn.state), reasoningPlan, log, sessionId);
+        processedMessages = guardCoreMessages(applyReasoningDrop(stripKernelSummaries(turn.messages, turn.state), reasoningPlan, log, sessionId), resolveTextSanitize(), log, sessionId);
         // #1001: a silent client history rewrite takes the same archive+prune path
         // as an announced /compact boundary — syncBlocks above has already
         // deactivated the blocks whose sources left the context. Skipped when
@@ -524,6 +524,9 @@ export async function prepareOpenai(
     // the array — a normalized body must not fire its own canary.
     rebuiltMessages = normalizeStrictEchoReasoning(rebuiltMessages, isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed)), log, sessionId);
     const rebuilt: OpenAIRequestBody = { ...parsed, messages: rebuiltMessages, tools: toolsOut as OpenAITool[] | undefined };
+    // 正文三道闸：最后一道出站兜底。只改发给模型的视图，
+    // 存盘（snapshotMessages(originalMessages)）与 content_hash 一字不动。
+    guardWireMessages(rebuilt.messages, resolveTextSanitize(), log, sessionId);
     warnReasoningPairs(rebuiltMessages, log, sessionId);
     clampOutgoingOutput(rebuilt as Record<string, unknown>, typeof (parsed as Record<string, unknown>).max_completion_tokens === "number" ? "max_completion_tokens" : "max_tokens", { systemText: openaiSystemText, tools: toolsOut, processedMessages, lastInputTokens: session.stats.lastInputTokens, lastInputTokensSource: session.stats.lastInputTokensSource, nativeWindow, headroomWindow: config.modelContextLimit, imageTokens: imageReserveFor(session, "openai", rebuilt, opts, billingUpstream ?? upstreamOrigin), kFactor: currentCalibrationFactor(session.stats, session.metadata?.lastModel), kOrigin: session.stats.calibratedEstimateOrigin, origin: billingUpstream ?? upstreamOrigin, ledgerFloorTokens: dshLedgerFloorTokens(session.metadata), knownOutputCeiling: resolveKnownOutputCeiling(req.headers, parsed as Record<string, unknown>, opts.routes, billingUpstream ?? upstreamOrigin, opts.sessionHeader, modelIdOf(parsed)) }, sessionId, log, (c) => { session.stats.lastOutputClamp = { ...c, at: Date.now() }; });
     // prompt_cache_retention is an OpenAI-host-only cache directive; the dsh
@@ -602,7 +605,7 @@ export async function prepareOpenai(
         });
         if (Object.keys(wpResponseHeaders).length === 0) wpResponseHeaders = undefined;
     }
-    return { body: JSON.stringify(rebuilt), parsedBody: rebuilt, session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, judgeBaseline, protocol: "openai", stream, compressInjected: injectTools, pluginMode, mcpDialectNote: laneDecisions.mcpDialect, nudge, nudgeOutcome, prompts, surface, openaiSystemText, systemNotes: sysNotes, renderTags: renderStrategy, responseExtraHeaders: wpResponseHeaders, dropReasoning: (msgs: BiliMessage[]) => applyReasoningDrop(msgs, reasoningPlan, log, sessionId) } as Prepared;
+    return { body: JSON.stringify(rebuilt), parsedBody: rebuilt, session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, judgeBaseline, protocol: "openai", stream, compressInjected: injectTools, pluginMode, mcpDialectNote: laneDecisions.mcpDialect, nudge, nudgeOutcome, prompts, surface, openaiSystemText, systemNotes: sysNotes, renderTags: renderStrategy, responseExtraHeaders: wpResponseHeaders, dropReasoning: (msgs: BiliMessage[]) => guardCoreMessages(applyReasoningDrop(msgs, reasoningPlan, log, sessionId), resolveTextSanitize(), log, sessionId) } as Prepared;
 }
 
 /** Append the ephemeral nudge to a Gemini `contents` array. Gemini is

@@ -1,4 +1,26 @@
-# billion-context
+# bili-context-evict
+
+> **This is not the original project.** It is a fork of
+> [ranxianglei/billion-context](https://github.com/ranxianglei/billion-context),
+> MIT-licensed, with the upstream `LICENSE` and copyright notice kept intact.
+>
+> What this fork adds:
+>
+> - **Block-level eviction.** Once a session has a `sleep.json` (a "sealed" marker)
+>   and the context crosses a watermark, whole turns and already-compressed blocks
+>   past the boundary are replaced by a one-line `[evicted: …]` marker. Originals
+>   stay in `index.db`; only the in-memory view is trimmed.
+> - **Three optional guards, all OFF by default** — see [EVICT.md §2.1](./EVICT.md):
+>   `textGuard.dropAssistantText` (keep assistant prose out of the next request),
+>   `textGuard.sanitize` (strip echoed input shapes and short cycles from outbound
+>   text), `textGuard.cycleGuard` (detect `好.好.好.` style short-period loops).
+>   Leave them off unless your assistant's prose is a scratchpad that is never
+>   meant to be seen — turning them on for a normal chat assistant will drop text
+>   the user is supposed to read.
+>
+> Upstream fixes do **not** flow in automatically. Merge them by hand.
+> The XDG directory name is still `billion-context` on purpose (switching it would
+> orphan every existing session index).
 
 <p align="center"><a href="./README.md">English</a> | <a href="./README.zh-CN.md">中文</a></p>
 

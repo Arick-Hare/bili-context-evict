@@ -1900,6 +1900,26 @@ type FileConfig = {
     resign?: ResignSchemeMap;
     /** 驱逐白名单原始配置（原样透传，由 src/evict.ts 自行解析）。 */
     evict?: unknown;
+    /**
+     * 出站正文三道闸（正文污染事故处方③）。**三项默认全关**：通用宿主可能
+     * 把 assistant 正文当作真正的回复，默认改写出站视图是侵入性的。
+     *  - dropAssistantText：请求体里不读回 assistant 的 text 块（治本）；
+     *  - sanitize：形状剥离 / 短周期折叠 / 长度上限（治标 + 兜底）；
+     *  - cycleGuard：源头短周期重复时 abort 上游流。
+     * 只改 OUTBOUND 视图，会话库 / content_hash / state 一律不动。
+     * env 优先级更高：BILI_TEXT_GUARD_DROP_ASSISTANT_TEXT / BILI_TEXT_SANITIZE /
+     * BILI_GUARDRAIL_TEXT_CYCLE（=1 开、=0 关）。
+     * 阈值同样可写在这里：maxChars（默认 4000）/ headChars（默认 200）/
+     * cycleMinRepeats（默认 10）；env 同名变量优先级更高。
+     */
+    textGuard?: {
+        dropAssistantText?: boolean;
+        sanitize?: boolean;
+        cycleGuard?: boolean;
+        maxChars?: number;
+        headChars?: number;
+        cycleMinRepeats?: number;
+    };
     /** Set `false` to log real (non-public) target hosts instead of the
      *  `<private-host>` placeholder (#897; env BILI_LOG_MASK_HOSTS=0 wins). */
     maskHosts?: boolean;

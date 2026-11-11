@@ -1,6 +1,7 @@
 /**
  * 会话隔离方案单测（验收 1/2/3/4/6）。
  * 用 XDG_CONFIG_HOME / DSH_HOME 指向临时目录做隔离，不碰真实配置。
+ * 归档根走通用 archiveRoot（不再假设宿主私有 stt 目录）。
  *
  *   $env:XDG_CONFIG_HOME=<tmp>\cfg; $env:DSH_HOME=<tmp>\home
  *   <DSH Node24> --import tsx --test verify-sleep-seq.mts
@@ -21,11 +22,11 @@ import {
 import type { EvictDbView } from "./src/evict-db.js";
 import type { CompressionState, CoreMessage } from "acp-kernel";
 
-const STT = path.join(process.env.XDG_CONFIG_HOME!, "stt-root");
+const ARCHIVE_ROOT = path.join(process.env.XDG_CONFIG_HOME!, "archive-root");
 const ARCHIVED = "archive.md";
 // verifyArchive 要求 archived 指向存在且非空的归档文件。
-mkdirSync(STT, { recursive: true });
-writeFileSync(path.join(STT, ARCHIVED), "# 归档\n某内容\n", "utf8");
+mkdirSync(ARCHIVE_ROOT, { recursive: true });
+writeFileSync(path.join(ARCHIVE_ROOT, ARCHIVED), "# 归档\n某内容\n", "utf8");
 
 const SID = "session-A";
 const SID_B = "session-B";
@@ -52,7 +53,7 @@ function writeMarker(sid: string, marker: SleepMarker) {
 }
 
 function gate(sid: string, db: EvictDbView, opts: Record<string, unknown> = {}) {
-  return checkSleepGate([msg("h1")], emptyState, { sessionId: sid, sttRoot: STT, db, ...opts });
+  return checkSleepGate([msg("h1")], emptyState, { sessionId: sid, archiveRoot: ARCHIVE_ROOT, db, ...opts });
 }
 
 test("验收 1：该会话 marker 有 boundarySeq → 闸门开（how=seq）", () => {
@@ -113,7 +114,7 @@ test("resolveBoundarySeq 纯函数：boundary-beyond-session 不依赖文件", (
 });
 
 test("验收 6：迁移 — 全局 sleep.json 复制到旧会话目录，原文件改名不删", () => {
-  const global = sleepFilePath(); // 默认 <DSH_HOME>/.dsh/heart/sleep.json
+  const global = sleepFilePath(); // 通用全局 <evictRoot>/sleep.json
   mkdirSync(path.dirname(global), { recursive: true });
   writeFileSync(global, JSON.stringify({ sessionId: SID, boundarySeq: 19900, archived: ARCHIVED }), "utf8");
   ensureSleepMigration({ sleepFile: undefined }, () => {});

@@ -3,6 +3,7 @@ import type { AbsorbConfig, CompressionCore, Config, CoreMessage, NudgeDecision,
 import { defaultCountTokens, renderNudgeText, viableRanges } from "acp-kernel";
 import { injectResponsesDeveloperMessage, type BiliMessage, type ResponseInputItem, type ResponsesProjection, type ResponsesRequestBody } from "acp-kernel/wire";
 import type { CompressReasoningConfig } from "../reasoning-drop.js";
+import { resolveTextSanitize, guardCoreMessages, guardWireMessages } from "../text-sanitize.js";
 import { resolveAbsorbSettings } from "../compress-settings.js";
 import { effectivePromptCacheRouting, resolveCompressProtocol, type CompressSettings, type ProxyOptions } from "../config.js";
 import { currentCalibrationFactor, strippedResponseIdWarning } from "../util.js";
@@ -408,7 +409,7 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
             modelWantsIt: turn.nudge !== undefined && (turn.nudge.shouldInject || emergencyNudgeArmed(session, turn.nudge, loopConfig.compress.minCompressRange, tokenCount, loopConfig.nudge.growthFloor)),
         });
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge, decideTier1Arm && !decideFallbackOverride, surfaceOffDetail(laneDecisions, opts.compress.injectTool)));
-        processedMessages = repairResponsesAssistantOrdering(applyReasoningDrop(stripKernelSummaries(turn.messages, turn.state), reasoningPlan, log, sessionId), originalMessages);
+        processedMessages = guardCoreMessages(repairResponsesAssistantOrdering(applyReasoningDrop(stripKernelSummaries(turn.messages, turn.state), reasoningPlan, log, sessionId), originalMessages), resolveTextSanitize(), log, sessionId);
         // #3477: consume the announced native-compaction boundary (pi session_compact
         // → /__bili/plugin/compact → markCompactionBoundary) exactly once, after the
         // post-compaction history was processed: archives the deactivated blocks,
@@ -612,6 +613,8 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
     // sentinel sees the array (a normalized body must not fire its own canary).
     if (Array.isArray(rebuiltInput)) rebuiltInput = normalizeStrictEchoResponsesInput(rebuiltInput, isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed)), log, sessionId);
     const rebuilt: ResponsesRequestBody = { ...parsed, input: rebuiltInput, tools: toolsOut };
+    // 正文三道闸：Responses wire 的出站兜底（上一轮漏接，本次补齐）。
+    guardWireMessages(rebuilt.input, resolveTextSanitize(), log, sessionId);
     warnResponsesReasoningPairs(Array.isArray(rebuiltInput) ? rebuiltInput : [], log, sessionId);
     if (!isCompactionTrigger) {
         clampOutgoingOutput(rebuilt as Record<string, unknown>, "max_output_tokens", { systemText: (responsesProjection?.systemParts ?? []).join("\n"), tools: toolsOut, processedMessages, lastInputTokens: session.stats.lastInputTokens, lastInputTokensSource: session.stats.lastInputTokensSource, nativeWindow, headroomWindow: config.modelContextLimit, imageTokens: imageReserveFor(session, "responses", rebuilt, opts, billingUpstream ?? upstreamOrigin), kFactor: currentCalibrationFactor(session.stats, session.metadata?.lastModel), kOrigin: session.stats.calibratedEstimateOrigin, origin: billingUpstream ?? upstreamOrigin, ledgerFloorTokens: dshLedgerFloorTokens(session.metadata), knownOutputCeiling: resolveKnownOutputCeiling(req.headers, parsed as Record<string, unknown>, opts.routes, billingUpstream ?? upstreamOrigin, opts.sessionHeader, modelIdOf(parsed)) }, sessionId, log, (c) => { session.stats.lastOutputClamp = { ...c, at: Date.now() }; });
@@ -724,7 +727,7 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         renderTags,
         resetAfterSuccess: isCompactionTrigger,
         codexForge,
-        dropReasoning: (msgs: BiliMessage[]) => applyReasoningDrop(msgs, reasoningPlan, log, sessionId),
+        dropReasoning: (msgs: BiliMessage[]) => guardCoreMessages(applyReasoningDrop(msgs, reasoningPlan, log, sessionId), resolveTextSanitize(), log, sessionId),
     };
 }
 

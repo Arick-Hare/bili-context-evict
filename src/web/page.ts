@@ -24,7 +24,7 @@ export function renderPage(origin: string, version: string, embed = false, theme
     // that used to miss every admin route and get relayed onto the configured
     // upstream (a wasted request + timeout noise in the log).
     return `<!doctype html><html lang="zh-CN"${theme ? ` data-theme="${theme}"` : ""}><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="icon" type="image/x-icon" href="/favicon.ico"><title>billion-context</title><style>${WEB_STYLES}</style></head><body${embed ? ' class="embed"' : ""}>
-<header class="topbar"><div class="brand"><span class="logo">∞</span>billion-context<span class="ver">v${version}</span></div><nav class="nav"><a href="#/overview" data-nav="overview" class="active" data-i18n="nav.overview">${zh("nav.overview")}</a><a href="#/sessions" data-nav="sessions" data-i18n="nav.sessions">${zh("nav.sessions")}</a><a href="#/config" data-nav="config" data-i18n="nav.config">${zh("nav.config")}</a><a href="#/connect" data-nav="connect" data-i18n="nav.connect">${zh("nav.connect")}</a><a href="#/logs" data-nav="logs" data-i18n="nav.logs">${zh("nav.logs")}</a><a href="#/updates" data-nav="updates" data-i18n="nav.updates">${zh("nav.updates")}</a><a href="#/blog" data-nav="blog" data-i18n="nav.blog">${zh("nav.blog")}</a></nav><div class="actions"><a class="fork-link" href="https://github.com/ranxianglei/billion-context" target="_blank" rel="noopener" data-i18n="fork.label">${zh("fork.label")}</a><button id="language-toggle" class="lang-btn">English</button></div></header>
+<header class="topbar"><div class="brand"><span class="logo">∞</span>billion-context<span class="ver">v${version}</span></div><nav class="nav"><a href="#/overview" data-nav="overview" class="active" data-i18n="nav.overview">${zh("nav.overview")}</a><a href="#/sessions" data-nav="sessions" data-i18n="nav.sessions">${zh("nav.sessions")}</a><a href="#/config" data-nav="config" data-i18n="nav.config">${zh("nav.config")}</a><a href="#/evict" data-nav="evict" data-i18n="nav.evict">${zh("nav.evict")}</a><a href="#/connect" data-nav="connect" data-i18n="nav.connect">${zh("nav.connect")}</a><a href="#/logs" data-nav="logs" data-i18n="nav.logs">${zh("nav.logs")}</a><a href="#/updates" data-nav="updates" data-i18n="nav.updates">${zh("nav.updates")}</a><a href="#/blog" data-nav="blog" data-i18n="nav.blog">${zh("nav.blog")}</a></nav><div class="actions"><a class="fork-link" href="https://github.com/ranxianglei/billion-context" target="_blank" rel="noopener" data-i18n="fork.label">${zh("fork.label")}</a><button id="language-toggle" class="lang-btn">English</button></div></header>
 <div id="passthrough-banner" class="banner warn" hidden></div>
 <div id="update-banner" class="banner warn" hidden></div>
 <div id="stale-banner" class="banner warn" hidden></div>
@@ -109,24 +109,6 @@ export function renderPage(origin: string, version: string, embed = false, theme
 <div class="cfg-dirty-note small" style="margin-top:10px;color:#9a6700" hidden><span data-i18n="cfg.unsaved">${zh("cfg.unsaved")}</span></div>
 <div style="margin-top:10px"><button id="save-pricing" class="btn"><span data-i18n="cfg.save">${zh("cfg.save")}</span></button></div>
 </div></div>
-<div class="card" id="card-evict"><div class="card-h"><span>驱逐状态 / 手动驱逐</span></div><div class="card-b">
-<p class="dim small" style="margin:0 0 12px">只读显示睡眠闸门与 boundary；两个按钮直接调用 /__bili/evict-now。「看一眼候选」只跑 dryRun，不写回。保存配置走深合并，未知字段（sttRoot / coldStore 等）原样保留。</p>
-<div id="evict-status-box" class="mono small" style="white-space:pre-wrap;line-height:1.7;color:var(--dim,#888)">加载中…</div>
-<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px">
-<button id="evict-refresh" class="btn sm">刷新状态</button>
-<button id="evict-now" class="btn sm">立即驱逐</button>
-<button id="evict-preview" class="btn sm">看一眼候选（dryRun）</button>
-</div>
-<div id="evict-result-box" class="mono small" style="white-space:pre-wrap;line-height:1.7;margin-top:10px" hidden></div>
-<div style="display:flex;flex-direction:column;gap:8px;margin-top:14px;padding-top:12px;border-top:1px solid rgba(127,127,127,.25)">
-<label style="display:flex;align-items:center;gap:8px;font-size:13px"><input type="checkbox" id="evict-boundary-from-sleep" checked> <span>boundaryFromSleep：从 sleep.json 取封盘线（关掉则忽略 sleep.json，只按水位触发）</span></label>
-<label style="display:flex;align-items:center;gap:8px;font-size:13px">seqRefCheck：
-<select id="evict-seq-ref-check" class="field-input" style="width:auto;min-width:110px"><option value="strict">strict（默认）</option><option value="warn">warn</option><option value="off">off</option></select>
-</label>
-<button id="evict-save-config" class="btn sm" style="align-self:flex-start">保存驱逐配置（深合并）</button>
-<span id="evict-save-note" class="dim small"></span>
-</div>
-</div></div>
 <div class="card" id="card-file"><div class="card-h"><span data-i18n="cfg.file">${zh("cfg.file")}</span></div><div class="card-b">
 <p class="dim small" style="margin:0 0 8px" data-i18n="cfg.file_desc">${zh("cfg.file_desc")}</p>
 <dl class="kv"><div class="k" data-i18n="dt.config_file">${zh("dt.config_file")}</div><div class="v" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><span id="cfg-path" class="mono dim small"></span><button id="copy-cfg-file" class="btn sm copy-btn" data-copy=""><span data-i18n="common.copy">${zh("common.copy")}</span></button></div></dl>
@@ -153,6 +135,64 @@ export function renderPage(origin: string, version: string, embed = false, theme
 <div class="card"><div class="card-h"><span data-i18n="cfg.passthrough">${zh("cfg.passthrough")}</span></div><div class="card-b"><p class="dim small" style="margin:0 0 10px" data-i18n="cfg.passthrough_desc">${zh("cfg.passthrough_desc")}</p><div class="pt-row"><span id="pt-state" class="badge disk">—</span><span id="pt-source" class="dim small"></span></div><div style="margin-top:10px"><button id="clear-passthrough" class="btn sm" hidden><span data-i18n="cfg.pt_clear">${zh("cfg.pt_clear")}</span></button></div></div></div>
 <div class="card"><div class="card-h"><span data-i18n="cfg.resign">${zh("cfg.resign")}</span></div><div class="card-b"><p class="dim small" style="margin:0 0 10px" data-i18n="cfg.resign_desc">${zh("cfg.resign_desc")}</p><div id="resign-body" style="display:flex;flex-direction:column;gap:10px"><span class="dim small" data-i18n="cfg.resign_loading">${zh("cfg.resign_loading")}</span></div></div></div>
 </div>
+</section>
+<section id="page-evict" class="page" hidden>
+<div class="page-head"><div><h1>驱逐</h1><div class="sub">睡眠闸门、边界、候选块与手动执行。保存只改驱逐这几项，配置文件里的其他字段原样保留。</div></div></div>
+<div class="card"><div class="card-h"><span>当前状态</span></div><div class="card-b">
+<div id="evict-status-box" class="small" style="line-height:1.8">加载中…</div>
+</div></div>
+<div class="card"><div class="card-h"><span>最近 5 次驱逐</span></div><div class="card-b">
+<p class="dim small" style="margin:0 0 8px">只列真正扔了东西的轮次，不被每请求的空记录或只裁工具结果的轮次淹没。时间 / 触发 / 回合 + 块 / 水位变化。</p>
+<div id="evict-history-box"><span class="dim small">加载中…</span></div>
+</div></div>
+<div class="card"><div class="card-h"><span>手动执行</span></div><div class="card-b">
+<p class="dim small" style="margin:0 0 10px">「看一眼候选」只预演，不写回；「立即驱逐」会真的执行一次。两个按钮都作用于下面勾选的会话。</p>
+<div style="display:flex;gap:8px;flex-wrap:wrap">
+<button id="evict-refresh" class="btn sm">刷新状态</button>
+<button id="evict-preview" class="btn sm">看一眼候选（预演）</button>
+<button id="evict-now" class="btn sm">立即驱逐</button>
+</div>
+<div id="evict-result-box" class="mono small" style="white-space:pre-wrap;line-height:1.7;margin-top:10px" hidden></div>
+</div></div>
+<div class="card"><div class="card-h"><span>生效会话</span></div><div class="card-b">
+<p class="dim small" style="margin:0 0 10px">自动驱逐和上面的按钮都只作用于勾选的会话。每条会话各算各的边界和块，没勾的不会被动。</p>
+<div id="evict-session-list" style="display:flex;flex-direction:column;gap:8px;margin-bottom:10px"><span class="dim small">加载中…</span></div>
+<div style="display:flex;gap:8px;flex-wrap:wrap">
+<button id="evict-select-all" class="btn sm">全选</button>
+<button id="evict-select-none" class="btn sm">全不选</button>
+</div>
+</div></div>
+<div class="card"><div class="card-h"><span>驱逐配置</span></div><div class="card-b">
+<div class="grid cols-2" style="gap:12px;margin-bottom:8px">
+<label style="display:flex;flex-direction:column;gap:6px;font-size:13px"><span>水位预算 budget</span>
+<input type="number" id="evict-budget" min="0.05" max="0.95" step="0.01" class="field-input" placeholder="0.2"></label>
+<label style="display:flex;flex-direction:column;gap:6px;font-size:13px"><span>目标水位 target</span>
+<input type="number" id="evict-target" min="0.05" max="0.95" step="0.01" class="field-input" placeholder="0.15"></label>
+</div>
+<p class="dim small" style="margin:0 0 12px">上下文占用超过 budget 开始驱逐，一路压到 target 以下。填 0 到 1 的小数，0.2 就是 20%。</p>
+<label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-bottom:10px"><input type="checkbox" id="evict-dry-run"> <span>dryRun：只预演不真扔（自动驱逐也遵守）</span></label>
+<label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-bottom:10px"><input type="checkbox" id="evict-boundary-from-sleep" checked> <span>boundaryFromSleep：从 sleep.json 取封盘线（关掉则忽略 sleep.json，只看水位）</span></label>
+<label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-bottom:12px">seqRefCheck：
+<select id="evict-seq-ref-check" class="field-input" style="width:auto;min-width:150px"><option value="strict">strict（严格对账，默认）</option><option value="warn">warn（对不上只记日志）</option><option value="off">off（不对账）</option></select>
+</label>
+<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+<button id="evict-save-config" class="btn sm">保存驱逐配置</button>
+<span id="evict-save-note" class="dim small"></span>
+</div>
+</div></div>
+<div class="card"><div class="card-h"><span>正文守卫（可选，默认全关）</span></div><div class="card-b">
+<p class="dim small" style="margin:0 0 12px;line-height:1.8">默认全关时，它就是纯驱逐插件：正文照常发送、照常回放，谁装了都不会被改写。只有当宿主把正文当草稿（不发送、每轮整段回放）时才需要打开。打开后正文不进下一轮请求体，但原文仍完整留在 <span class="mono">index.db</span> 里可查。</p>
+<label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-bottom:10px"><input type="checkbox" id="tg-drop-assistant-text"> <span>dropAssistantText：请求体里不读回 assistant 正文（治本）</span></label>
+<label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-bottom:10px"><input type="checkbox" id="tg-sanitize"> <span>sanitize：剥注入形状 / 折短周期 / 截超长（治标兜底）</span></label>
+<label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-bottom:10px"><input type="checkbox" id="tg-cycle-guard"> <span>cycleGuard：输出流里检测短周期循环并中止生成</span></label>
+<div class="grid cols-2" style="gap:12px;margin:12px 0">
+<label style="display:flex;flex-direction:column;gap:6px;font-size:13px"><span>maxChars（单条正文上限，默认 4000）</span>
+<input type="number" id="tg-max-chars" min="100" step="100" class="field-input" placeholder="4000"></label>
+<label style="display:flex;flex-direction:column;gap:6px;font-size:13px"><span>cycleMinRepeats（重复几次算循环，默认 10）</span>
+<input type="number" id="tg-cycle-repeats" min="2" step="1" class="field-input" placeholder="10"></label>
+</div>
+<p class="dim small" style="margin:0">三个开关和两个阈值随上面的「保存驱逐配置」一起写入，重启后保持。开源默认全关，不要替别人打开。</p>
+</div></div>
 </section>
 <section id="page-logs" class="page" hidden>
 <div class="page-head"><div><h1 data-i18n="logs.title">${zh("logs.title")}</h1><div class="sub" data-i18n="logs.sub">${zh("logs.sub")}</div></div></div>

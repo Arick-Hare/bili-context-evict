@@ -1,29 +1,27 @@
 /**
- * Context eviction step (二期): 在压缩循环之后，把「已落盘长期记忆」的旧
- * 对话回合整块驱逐，换成一行 `[evicted: …]` 标记，让同一条会话的上下文体量
- * 在压扁之后还能继续下降（而不是只压内容不压条数）。
+ * Context eviction：在压缩之后，把已经由外部归档的旧对话回合整块驱逐，换成
+ * 一行 `[evicted: …]` 标记，让同一会话的上下文体量在压扁之后还能继续下降。
  *
- * 设计要点（对应《上下文驱逐 + 分层记忆：二期设计说明》）：
+ * 本版本能力边界（与 README 保持一致）：
+ *   - 摘要压缩（kernel 既有能力）
+ *   - 工具结果裁剪（dropToolResults）
+ *   - 块级驱逐（本模块）
+ * 插件**不提供**记忆写入、语义检索或跨会话召回，也不依赖任何记忆系统实现。
+ *
+ * 设计要点：
+ *  - 唯一门槛是 sleep.json 闸门（checkSleepGate）：边界之前的原文才允许丢，
+ *    任何一项校验不过都 fail-closed。接入方只需自己保证「边界之前已留底」。
  *  - 复用 kernel 的 `applyCompression` + `prune`：驱逐 = 程序化构造 ranges，
- *    summary 就是那行 evicted 标记，完全走现有 block/coverage 机制，不新增
- *    state 结构，持久化天然安全。
- *  - 驱逐粒度 = 完整「回合」（一条 user 消息 + 它后面的 assistant/tool 段，
- *    到下一 user 之前）。旧的 user 消息也一起驱逐（内容已落盘长期记忆），
- *    否则 user 消息越积越多，能驱逐的量越来越少，最后还是会爆。
- *  - 只保护：第一条 user（会话锚点，kernel 也硬 pin 它）+ 最近
- *    preserveRecentMessages 条 user（当前上下文）。
- *  - 落盘判断默认用方案 (a) 标注式：回合之后出现过记忆写盘工具（memory_append /
- *    heart_note / heart_self / soul_update 等）即视为已落盘。coverage 方案保留
- *    为可选项（EVICT_PERSIST_CHECK=coverage 或文件里配），但阈值默认 0.3 ——
- *    实测这条会话对 18 个记忆文件的关键词命中率只有 0.17~0.46，0.6 永远不过。
+ *    summary 就是那行 evicted 标记，不新增 state 结构。
+ *  - 粒度 = 完整「回合」（一条 user + 其后的 assistant/tool 段，到下一 user 前）。
+ *    只保护第一条 user（会话锚点）+ 最近 preserveRecentMessages 条 user。
+ *  - 原文不删除：每个 session 的 index.db 保留完整消息，驱逐只改发给模型的视图。
  *  - dryRun 默认 false（真驱逐）；想先观察就 EVICT_DRY_RUN=1。
- *  - 自动触发挂在请求 lane（prepare-anthropic / prepare-openai）里：DSH 这条
- *    部署根本不走 loop/core.ts 的 ACP 回合循环，挂在那儿是死代码。
+ *  - 自动触发挂在请求 lane（prepare-anthropic / prepare-openai）。
  */
 import { mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import path from "node:path";
-import { prune, deactivateBlock } from "acp-kernel";
+import { prune } from "acp-kernel";
 import type {
   CompressionCore,
   CompressionState,
@@ -34,6 +32,7 @@ import { loadConfigFile } from "./config.js";
 import { recordEviction } from "./evict-history.js";
 import { checkSleepGate, ensureSleepMigration, type SleepGateOpts } from "./sleep.js";
 import { openEvictDb, type BlockSpanRow, type EvictDbView } from "./evict-db.js";
+import { evictRoot, stateDir } from "./paths.js";
 
 export interface EvictFileSettings {
   enabled?: boolean;
@@ -53,6 +52,9 @@ export interface EvictFileSettings {
   actTools?: string[];
   memoryRoot?: string;
   memoryScope?: string;
+  /** 归档根目录（通用名，sleep.json 的 archived 相对它）。 */
+  archiveRoot?: string;
+  /** @deprecated 用 archiveRoot；保留以兼容旧配置。 */
   sttRoot?: string;
   sleepFile?: string;
   trimFile?: string;
@@ -60,6 +62,12 @@ export interface EvictFileSettings {
   boundaryFromSleep?: boolean;
   /** 4.3：ref 对账失败时的处置，默认 strict。 */
   seqRefCheck?: "strict" | "warn" | "off";
+  /**
+   * strict 下的白名单：这些 blockId 的 ref 与 seq 不同源（常见于块合并 /
+   * 重编号），对账必然失败，但封盘判定仍按 seq 走，允许放行并在日志里写明。
+   * 默认空 —— 通用部署保持严格，不让任何块悄悄绕过对账。
+   */
+  refMismatchAllow?: string[];
 }
 
 export function parseEvictSettings(obj: unknown): EvictFileSettings | undefined {
@@ -95,6 +103,7 @@ export function parseEvictSettings(obj: unknown): EvictFileSettings | undefined 
   }
   if (typeof o.memoryRoot === "string" && o.memoryRoot.length > 0) out.memoryRoot = o.memoryRoot;
   if (typeof o.memoryScope === "string" && o.memoryScope.length > 0) out.memoryScope = o.memoryScope;
+  if (typeof o.archiveRoot === "string" && o.archiveRoot.length > 0) out.archiveRoot = o.archiveRoot;
   if (typeof o.sttRoot === "string" && o.sttRoot.length > 0) out.sttRoot = o.sttRoot;
   if (typeof o.sleepFile === "string" && o.sleepFile.length > 0) out.sleepFile = o.sleepFile;
   if (typeof o.trimFile === "string" && o.trimFile.length > 0) out.trimFile = o.trimFile;
@@ -102,6 +111,10 @@ export function parseEvictSettings(obj: unknown): EvictFileSettings | undefined 
   if (typeof o.boundaryFromSleep === "boolean") out.boundaryFromSleep = o.boundaryFromSleep;
   if (o.seqRefCheck === "strict" || o.seqRefCheck === "warn" || o.seqRefCheck === "off") {
     out.seqRefCheck = o.seqRefCheck;
+  }
+  if (Array.isArray(o.refMismatchAllow)) {
+    const s = o.refMismatchAllow.filter((x) => typeof x === "string" && x.length > 0);
+    if (s.length > 0) out.refMismatchAllow = s;
   }
   if (Object.keys(out).length === 0) return undefined;
   return out;
@@ -118,11 +131,11 @@ export interface EvictConfig {
   batchTokens: number;
   /** 驱逐顺序，目前只支持 oldest（从最老开始）。 */
   order: "oldest";
-  /** 没落盘不许扔。 */
+  /** 没落盘不许扔（保留字段；当前门槛是 sleep.json 闸门，见 checkSleepGate）。 */
   requirePersisted: boolean;
-  /** 方案 (b) 的关键词覆盖率阈值，保留占位。 */
+  /** 关键词覆盖率阈值，保留占位（诊断路径，非门槛）。 */
   persistThreshold: number;
-  /** 视为「记忆写盘」的工具名（方案 a 的落盘证据）。 */
+  /** 可选的「写盘证据」工具名；通用版默认空，由接入方自行注入。 */
   writeTools: string[];
   /** 视为「只读」的工具名（expl 集优先扔）。 */
   readTools: string[];
@@ -131,21 +144,19 @@ export interface EvictConfig {
   /** 先 log 不扔；false 时真驱逐。 */
   dryRun: boolean;
   /**
-   * 落盘判断方式：
-   *  - annotated：检查回合之后有没有 writeTools 调用；
-   *  - coverage：关键词覆盖率；
-   *  - memory-mtime：记忆文件 mtime 晚于回合结束时间；
-   *  - auto（默认）：消息里有 tool-call 就用 annotated，否则 memory-mtime
-   *    （DSH 这条 lane 是 text-only 渲染，工具调用会被剥掉，annotated 永远判不过）。
+   * 落盘判断方式（诊断路径，当前版本**不参与**驱逐门槛；真正的门槛是
+   * sleep.json 闸门）。默认 off —— 通用部署不带任何记忆系统假设。
    */
-  persistCheck: "annotated" | "coverage" | "memory-mtime" | "auto";
-  /** memory 根目录覆盖（默认 $DSH_HOME/soul-md/memory 或 ~/.dsh/soul-md/memory）。 */
+  persistCheck: "annotated" | "coverage" | "memory-mtime" | "auto" | "off";
+  /** 可选诊断用的记忆根目录（默认 `<evictRoot>/memory`，不依赖宿主布局）。 */
   memoryRoot?: string;
-  /** 人格卡 scope 覆盖（默认扫描 memory 根下唯一子目录）。 */
+  /** 可选诊断用的记忆 scope（默认扫描 memory 根下子目录）。 */
   memoryScope?: string;
-  /** 睡眠标记文件覆盖（默认 $DSH_HOME/heart/sleep.json）。 */
+  /** 全局 sleep.json 路径覆盖（仅迁移用；闸门读 per-session 文件）。 */
   sleepFile?: string;
-  /** stt 根目录覆盖（默认 $DSH_HOME/profiles/desktop/stt）。 */
+  /** 归档根目录覆盖（默认 `<evictRoot>/archive`）。 */
+  archiveRoot?: string;
+  /** @deprecated 用 archiveRoot；保留以兼容旧配置。 */
   sttRoot?: string;
   /**
    * 只丢旧的工具结果：水位过线时把更早的 tool-result 正文换成一行占位符，
@@ -156,7 +167,7 @@ export interface EvictConfig {
   keepToolResultRounds: number;
   /** 小于这个字符数的工具结果不值得丢。 */
   minToolResultChars: number;
-  /** 截断位记录文件覆盖（默认 ~/.local/state/billion-context/trim.json）。 */
+  /** 截断位记录文件覆盖（默认 `<stateDir>/trim.json`，走 XDG）。 */
   trimFile?: string;
   /** 会话白名单：驱逐只对这些 sessionId 生效（空 = 不驱逐任何会话）。 */
   sessions?: string[];
@@ -164,6 +175,8 @@ export interface EvictConfig {
   boundaryFromSleep: boolean;
   /** 4.3：ref 对账失败时：strict=跳过该块 / warn=只警告 / off=根本不看 ref。 */
   seqRefCheck: "strict" | "warn" | "off";
+  /** strict 下允许「ref 与 seq 不同源」但按 seq 放行的块（默认空）。 */
+  refMismatchAllow: string[];
 }
 
 export const DEFAULT_EVICT_CONFIG: EvictConfig = {
@@ -174,16 +187,9 @@ export const DEFAULT_EVICT_CONFIG: EvictConfig = {
   order: "oldest",
   requirePersisted: true,
   persistThreshold: 0.3,
-  writeTools: [
-    "memory_append",
-    "memory_rewrite",
-    "memory_write",
-    "heart_note",
-    "heart_self",
-    "heart_summary",
-    "heart_longterm",
-    "soul_update",
-  ],
+  // 通用版不预设任何「记忆写盘工具」：这些名字属于接入方自己的系统。
+  // 需要诊断路径时由 evict.writeTools / EVICT_WRITE_TOOLS 显式注入。
+  writeTools: [],
   readTools: ["read", "grep", "glob", "search_context", "list", "ls"],
   actTools: [
     "edit",
@@ -195,19 +201,20 @@ export const DEFAULT_EVICT_CONFIG: EvictConfig = {
     "run",
   ],
   dryRun: false,
-  persistCheck: "auto",
+  persistCheck: "off",
   dropToolResults: true,
   keepToolResultRounds: 6,
   minToolResultChars: 200,
   boundaryFromSleep: true,
   seqRefCheck: "strict",
+  refMismatchAllow: [],
 };
 
 /** 把外部字符串收敛成合法的落盘判断方式。 */
 function asPersistCheck(
   v: string | undefined,
 ): EvictConfig["persistCheck"] | undefined {
-  return v === "annotated" || v === "coverage" || v === "memory-mtime" || v === "auto"
+  return v === "off" || v === "annotated" || v === "coverage" || v === "memory-mtime" || v === "auto"
     ? v
     : undefined;
 }
@@ -337,6 +344,7 @@ export function resolveEvictConfig(
     memoryRoot: env.EVICT_MEMORY_ROOT ?? fileEvict?.memoryRoot,
     memoryScope: env.EVICT_MEMORY_SCOPE ?? fileEvict?.memoryScope,
     sleepFile: env.EVICT_SLEEP_FILE ?? fileEvict?.sleepFile,
+    archiveRoot: env.EVICT_ARCHIVE_ROOT ?? fileEvict?.archiveRoot,
     sttRoot: env.EVICT_STT_ROOT ?? fileEvict?.sttRoot,
     dropToolResults: pickBool(
       env.EVICT_DROP_TOOL_RESULTS,
@@ -364,6 +372,9 @@ export function resolveEvictConfig(
       env.EVICT_SEQ_REF_CHECK === "strict" || env.EVICT_SEQ_REF_CHECK === "warn" || env.EVICT_SEQ_REF_CHECK === "off"
         ? env.EVICT_SEQ_REF_CHECK
         : fileEvict?.seqRefCheck ?? DEFAULT_EVICT_CONFIG.seqRefCheck,
+    refMismatchAllow: env.EVICT_REF_MISMATCH_ALLOW
+      ? env.EVICT_REF_MISMATCH_ALLOW.split(",").map((s) => s.trim()).filter((s) => s.length > 0)
+      : fileEvict?.refMismatchAllow ?? DEFAULT_EVICT_CONFIG.refMismatchAllow,
   };
 }
 
@@ -400,10 +411,11 @@ export function sessionSelected(
   return false;
 }
 
-// ── memory 路径（与 dsh-soul-md/memory-layout.js 保持一致）─────────────────
-// 不直接 import dsh-soul-md：其 package.json 的 exports 不暴露 memory-layout.js，
-// 且入口 index.js 有插件副作用。这里内置一份一致的 safeMemoryName + 路径规则，
-// scope（人格卡名）改名时必须与 dsh-soul-md 同步，否则算出的路径就写丢了。
+// ── 可选记忆诊断路径 ───────────────────────────────────────────────────────
+// 通用版不假设任何外部记忆系统：默认根目录落在插件自己的 evictRoot 下。
+// 这几组函数只服务于 coverage / memory-mtime 两种**诊断**判定，不是驱逐门槛
+// （门槛是 sleep.json 闸门）。接入方有自己的记忆布局时，用 evict.memoryRoot /
+// EVICT_MEMORY_ROOT 指过去即可。
 
 function safeMemoryName(value: string, fallback = "memory"): string {
   return String(value ?? "")
@@ -414,11 +426,7 @@ function safeMemoryName(value: string, fallback = "memory"): string {
 
 function memoryRoot(override: string | undefined): string {
   if (override && override.length > 0) return override;
-  const dshHome = process.env.DSH_HOME;
-  if (dshHome && dshHome.length > 0) {
-    return path.join(dshHome, "soul-md", "memory");
-  }
-  return path.join(homedir(), ".dsh", "soul-md", "memory");
+  return path.join(evictRoot(), "memory");
 }
 
 function resolveMemoryScope(root: string, override: string | undefined): string {
@@ -715,6 +723,9 @@ export interface EvictOutcome {
   messages: CoreMessage[];
   state: CompressionState;
   evictedCount: number;
+  /** 拆分口径：落地回合范围数 / 摘要块数（evictedCount = 两者之和）。 */
+  evictedTurns: number;
+  evictedBlocks: number;
   reclaimedTokens: number;
 }
 
@@ -797,6 +808,8 @@ export interface BlockCandidateContext {
   refForSeq?: (seq: number) => string | null;
   /** 4.3：ref 对账失败时的处置。 */
   seqRefCheck?: "strict" | "warn" | "off";
+  /** strict 下按 seq 放行的 blockId 白名单（ref 与 seq 不同源的历史块）。 */
+  refMismatchAllow?: ReadonlySet<string>;
   log?: (msg: string) => void;
 }
 
@@ -876,8 +889,18 @@ export function collectBlockCandidatesDetailed(
           };
           stats.mismatches.push(mm);
           stats.refMismatch++;
-          log(`[evict][block] ref 对账不一致 ${b.blockId} ${side} ref=m${refNum} DB_seq=${actual} 块_seq=${blockSeq} → ${mode === "strict" ? "跳过该块" : "仅警告"}`);
-          if (mode === "strict") {
+          // 实测偏差并不都是 1（见过 +14 / +44 / -2），说明 ref 与 seq 不同源，
+          // 不是单一的 off-by-one，不能靠 ±1 容忍修。seq 才是封盘裁判；
+          // 白名单里的块在 strict 下按 seq 放行，并把原因写清楚。
+          const allowed = ctx.refMismatchAllow?.has(b.blockId) === true;
+          log(`[evict][block] ref 对账不一致 ${b.blockId} ${side} ref=m${refNum} DB_seq=${actual} 块_seq=${blockSeq}（偏差 ${actual - (blockSeq as number)}，ref 与 seq 不同源，常见于块合并/重编号）→ ${
+            allowed
+              ? "白名单放行（封盘仍按 seq 判定）"
+              : mode === "strict"
+                ? "跳过该块；确认可靠可加入 evict.refMismatchAllow 放行"
+                : "仅警告"
+          }`);
+          if (mode === "strict" && !allowed) {
             // strict：整块跳过。用标记跳出双层循环。
             hitsProtected = true;
             break;
@@ -948,7 +971,7 @@ interface TrimState {
 
 function trimFilePath(evict: EvictConfig): string {
   if (evict.trimFile) return evict.trimFile;
-  return path.join(homedir(), ".local", "state", "billion-context", "trim.json");
+  return path.join(stateDir(), "trim.json");
 }
 
 function loadTrimState(file: string): TrimState {
@@ -1024,6 +1047,42 @@ export function dropToolOutputs(
 }
 
 /**
+ * 补丁四：把一个 active 摘要块的 summary 换成 evicted 标记。
+ * 纯函数、不改入参；返回是否落地与回收字符数，供调用方手动累加计数
+ * （不再有 applyCompression 的返回值可用）。
+ * 已经是标记的块直接跳过，保证幂等；始终保持 active:true —— kernel 的
+ * collectSummaryAnchors 只渲染 activeBlocks(state)，标 inactive 就没人注入。
+ */
+export interface SummarySwapResult {
+  state: CompressionState;
+  applied: boolean;
+  reclaimedChars: number;
+}
+
+export function swapBlockSummary(
+  state: CompressionState,
+  blockId: string,
+  marker: string,
+  summaryChars: number,
+): SummarySwapResult {
+  const target = state.blocks.find((b) => b.blockId === blockId);
+  if (!target || target.summary.startsWith("[evicted:")) {
+    return { state, applied: false, reclaimedChars: 0 };
+  }
+  return {
+    state: {
+      ...state,
+      blocks: state.blocks.map((b) =>
+        b.blockId === blockId
+          ? { ...b, summary: marker, topic: "evicted", active: true }
+          : b),
+    },
+    applied: true,
+    reclaimedChars: Math.max(0, summaryChars - marker.length),
+  };
+}
+
+/**
  * 驱逐台阶。返回 null 表示本次什么都没做（水位没到 / 没可驱逐的回合 / dryRun）。
  * 调用方负责在真驱逐后把返回的 messages/state 写回 session。
  */
@@ -1088,7 +1147,7 @@ export function maybeEvict(
 
   if (ratio < evict.budget) {
     if (trimTokens > 0 && !evict.dryRun) {
-      return { messages, state, evictedCount: 0, reclaimedTokens: trimTokens };
+      return { messages, state, evictedCount: 0, evictedTurns: 0, evictedBlocks: 0, reclaimedTokens: trimTokens };
     }
     if (trace) {
       trace.reason = `水位 ${(ratio * 100).toFixed(1)}% < 预设 ${(evict.budget * 100).toFixed(0)}%（${contextTokens}/${limit}），未到触发线`;
@@ -1107,7 +1166,7 @@ export function maybeEvict(
     log(
       `[evict] 丢工具结果后水位 ${(afterTrim / limit * 100).toFixed(1)}% ≤ 目标 ${(evict.target * 100).toFixed(0)}%，不折对话`,
     );
-    return { messages, state, evictedCount: 0, reclaimedTokens: trimTokens };
+    return { messages, state, evictedCount: 0, evictedTurns: 0, evictedBlocks: 0, reclaimedTokens: trimTokens };
   }
 
   // 补丁二：只读 DB 视图（index.db）。块的 seq、boundary 的 ref→seq 换算、
@@ -1118,7 +1177,7 @@ export function maybeEvict(
   ensureSleepMigration(evict, log);
   const gateOpts: SleepGateOpts = {
     sleepFile: evict.sleepFile,
-    sttRoot: evict.sttRoot,
+    archiveRoot: evict.archiveRoot ?? evict.sttRoot,
     sessionId,
     db,
     boundaryFromSleep: evict.boundaryFromSleep,
@@ -1130,7 +1189,7 @@ export function maybeEvict(
   if (!gate.ok) {
     log(`[evict] 睡眠闸门未开：${gate.reason}`);
     if (trimTokens > 0 && !evict.dryRun) {
-      return { messages, state, evictedCount: 0, reclaimedTokens: trimTokens };
+      return { messages, state, evictedCount: 0, evictedTurns: 0, evictedBlocks: 0, reclaimedTokens: trimTokens };
     }
     if (trace) trace.reason = `睡眠闸门未开：${gate.reason}`;
     return null;
@@ -1256,6 +1315,7 @@ export function maybeEvict(
           }
         : undefined,
       seqRefCheck: evict.seqRefCheck,
+      refMismatchAllow: new Set(evict.refMismatchAllow ?? []),
       log,
     },
   );
@@ -1438,7 +1498,10 @@ export function maybeEvict(
               : res.result.noop
                 ? "noop（范围已经折叠过）"
                 : "未知原因";
-        log(`[evict] 跳过范围（applyCompression 拒绝）：${startRef}..${endRef} — ${detail.slice(0, 240)}`);
+        // 回合组是把 messages 里的原文折成新块，与「改已有块 summary」语义
+        // 不同，不能套用补丁四的写法。noop 通常意味着该范围早已折叠过——
+        // 那条路该由下面的块驱逐接手，这里留一句明确诊断，别当明天的哑雷。
+        log(`[evict] 跳过范围（applyCompression 拒绝）：${startRef}..${endRef} — ${detail.slice(0, 240)}${res.result.noop ? "；范围可能已是摘要块，应由块驱逐处理" : ""}`);
         continue;
       }
       newState = res.state;
@@ -1452,18 +1515,21 @@ export function maybeEvict(
     }
   }
 
-  // ── 驱逐重做：把选中的 active 摘要块换成一行 evicted 标记 ──────────────
-  // 顺序必须是「先 deactivate 旧块 → 再对同一范围 applyCompression 造新块」：
-  // 反了会被 kernel 判「范围已经折叠过」noop。且每块原子化 —— 任一步失败
-  // 就丢弃临时 state，绝不提交只 deactivate 的状态，否则 prune 会把原文
-  // 恢复出来，上下文反而变大。新块的 summary 就是那行标记，复用 kernel 的
-  // block/coverage 机制，不新增 state 结构；旧块标 active:false 不再注入，
-  // 视图里那块长摘要就此消失。
+  // ── 驱逐重做（补丁四）：把选中的 active 摘要块直接换成一行 evicted 标记 ──
+  // 语义修正：applyCompression 是「把 messages 里的一段原文折成新块」，但这些
+  // 块的原文早在当初折叠时就被换成了摘要，messages 里根本没有原文可折 ——
+  // 所以 blocksCreated 永远是 0（实测 51 个块全被拒）。正确做法是改已有块的
+  // summary：kernel 的 collectSummaryAnchors 用 activeBlocks(state) 的
+  // block.summary 渲染摘要消息，prune 后视图里那块长摘要就变成一行标记。
+  // 绝不能 deactivate：active:false 的块不再出现在 activeBlocks 里，换了也没
+  // 人注入。幂等由 collectBlockCandidatesDetailed 里
+  // summary.startsWith("[evicted:") 的跳过判定保证。
+  // 计数因为没有 applyCompression 返回值，必须自己累加（evictedCount /
+  // reclaimedTokens 全靠这两个数）。
   let appliedBlocks = 0;
   let reclaimedBlockChars = 0;
-  // 真实生效配置 compress.minSummaryLength 默认 50；一行的短标记只有 ~40 字符，
-  // 会被 kernel 的 validateSummaryLength 整批拒掉（补丁一实测：38 字符 →
-  // blocksCreated=0，68 字符 → 1）。这里按配置动态补齐，不硬编码长度。
+  // 标记仍按 minSummaryLength 补齐：不再过 kernel 的 validateSummaryLength，
+  // 但保留足够长度便于回溯，且与旧标记形状保持一致。
   const minSummaryLength =
     typeof config.compress?.minSummaryLength === "number" && config.compress.minSummaryLength > 0
       ? Math.floor(config.compress.minSummaryLength)
@@ -1471,43 +1537,20 @@ export function maybeEvict(
   for (const unit of blockCandidates) {
     if (!unit.startRef || !unit.endRef) {
       log(`[evict] 跳过摘要块（无可用 range 边界）：${unit.blockId} seq ${unit.startSeq}..${unit.endSeq}`);
-      continue; // 不提交只 deactivate 的 state
+      continue;
     }
     const base = `[evicted: 块 ${unit.blockId} · 折叠于 ${new Date(unit.createdTurn).toISOString().slice(11, 16)} · 原文 ${unit.effectiveMessageIds.length} 条 · 已归档，摘要整体丢弃，仅留此标记供回溯]`;
     const marker = base.length >= minSummaryLength
       ? base
       : base + " · " + "归档".repeat(Math.ceil((minSummaryLength - base.length) / 2) + 1);
-    const range = [{ startRef: unit.startRef, endRef: unit.endRef, summary: marker }];
-    const trialState = deactivateBlock(newState, [unit.blockId]);
-    try {
-      let res = core.applyCompression({
-        ranges: range,
-        messages,
-        state: trialState,
-        config,
-        protectedMessageIds: protectedIds,
-      });
-      if (res.result.blocksCreated === 0) {
-        // 同 Episode 逻辑：被 minCompressRange 挡住时降阈值再试一次。
-        res = core.applyCompression({
-          ranges: range,
-          messages,
-          state: trialState,
-          config: { ...config, compress: { ...config.compress, minCompressRange: 0 } },
-          protectedMessageIds: protectedIds,
-        });
-      }
-      if (res.result.blocksCreated === 0) {
-        log(`[evict] 跳过摘要块（applyCompression 拒绝）：${unit.blockId} ${unit.startRef}..${unit.endRef}`);
-        continue; // 不提交 trialState
-      }
-      newState = res.state; // 原子提交
-      appliedBlocks++;
-      reclaimedBlockChars += Math.max(0, unit.summaryChars - marker.length);
-    } catch (err) {
-      log(`[evict] 跳过摘要块（异常）：${unit.blockId} — ${String(err).slice(0, 240)}`);
-      continue; // 不提交 trialState
+    const swap = swapBlockSummary(newState, unit.blockId, marker, unit.summaryChars);
+    if (!swap.applied) {
+      log(`[evict] 跳过摘要块（state 里不存在或已是标记）：${unit.blockId}`);
+      continue;
     }
+    newState = swap.state;
+    appliedBlocks++;
+    reclaimedBlockChars += swap.reclaimedChars;
   }
   if (appliedBlocks > 0) {
     log(`[evict] 扔摘要块：${appliedBlocks} 块 / ${reclaimedBlockChars} 字符`);
@@ -1515,15 +1558,15 @@ export function maybeEvict(
   }
 
   if (appliedCount === 0 && appliedBlocks === 0) {
-    log("[evict] 所有范围都被 applyCompression 拒绝，无可驱逐内容");
+    log("[evict] 本轮无可驱逐内容（回合范围与摘要块都没有落地）");
     if (trace) {
-      trace.reason = `水位已过线、也已落盘，但 ${chosen.length} 块回合 / ${blockCandidates.length} 个摘要块全部被 kernel 拒绝（原因见 bili.log）`;
+      trace.reason = `水位已过线、也已落盘，但 ${chosen.length} 块回合 / ${blockCandidates.length} 个摘要块都没能落地（原因见 bili.log）`;
     }
     return null;
   }
 
   log(
-    `[evict] applyCompression 成功折叠 ${appliedCount} 个范围（约 ${appliedTokens} tokens），跳过 ${chosen.length - appliedCount} 个`,
+    `[evict] 落地 ${appliedCount} 个回合范围 + ${appliedBlocks} 个摘要块（约 ${appliedTokens} tokens），跳过 ${chosen.length - appliedCount} 个范围`,
   );
 
   let newMessages: CoreMessage[];
@@ -1541,14 +1584,15 @@ export function maybeEvict(
     messages: newMessages,
     state: newState,
     evictedCount: appliedCount + appliedBlocks,
+    evictedTurns: appliedCount,
+    evictedBlocks: appliedBlocks,
     reclaimedTokens: appliedTokens,
   };
 }
 
 // ── 请求 lane 的自动触发 ───────────────────────────────────────────────────
-// DSH 这条部署的真实请求走 server 的 prepare-anthropic / prepare-openai
-// （kernel processTurn + preflightCompressIfNeeded），并不经过 loop/core.ts
-// 的 ACP 回合循环 —— 2026-11-03 实测 bili.log 里 `[evict-diag]` 一条没有。
+// 真实请求走 server 的 prepare-anthropic / prepare-openai（kernel processTurn
+// + preflightCompressIfNeeded），不经过 loop/core.ts 的 ACP 回合循环。
 // 自动驱逐必须挂在请求 lane 上，否则永远不会跑。
 
 let autoConfigCache: { at: number; config: EvictConfig } | null = null;
@@ -1600,6 +1644,9 @@ export function lastRequestSnapshot(session: object): LastRequestSnapshot | unde
  * budget 时，把已落盘的旧回合折叠成 `[evicted: …]` 标记。成功时成对改写
  * turn.messages 与 turn.state；调用方仍负责把 outcome.state 写回 session。
  */
+/** 每次进程只提示一次，避免把日志刷爆。 */
+let amnesiaNoticeShown = false;
+
 export function autoEvictTurn(
   core: CompressionCore,
   sessionId: string,
@@ -1613,6 +1660,15 @@ export function autoEvictTurn(
   const evict = currentEvictConfig();
   if (!evict.enabled) return null;
   if (!sessionSelected(sessionId, evict.sessions)) return null;
+  if (!amnesiaNoticeShown) {
+    amnesiaNoticeShown = true;
+    log(
+      "warn",
+      "[evict] 本插件只做摘要压缩 / 工具结果裁剪 / 块级驱逐，不提供记忆检索。"
+      + " 若接入方没有独立的记忆系统与检索工具，模型可能想不起被驱逐的早期上下文（假性失忆）。"
+      + " 原文并未删除：每个 session 的 index.db 保留完整消息，可用 `bili export <session> --full` 或 Web 会话详情翻回。",
+    );
+  }
   log(
     "info",
     `[evict-diag] sid=${sessionId} hit=true enabled=true budget=${evict.budget} target=${evict.target} limit=${
@@ -1643,6 +1699,8 @@ export function autoEvictTurn(
     trigger: "auto",
     sessionId,
     evictedCount: outcome?.evictedCount ?? 0,
+    evictedTurns: outcome?.evictedTurns ?? 0,
+    evictedBlocks: outcome?.evictedBlocks ?? 0,
     reclaimedTokens: outcome?.reclaimedTokens ?? 0,
     beforeRatio,
     afterRatio: outcome ? afterRatio : beforeRatio,

@@ -3,6 +3,7 @@ import type { CompressionCore, Config, CoreMessage, NudgeDecision, PackSurface, 
 import { renderNudgeText, viableRanges } from "acp-kernel";
 import { coreToGoogle, googleToCore, normalizeGoogleUserPartOrder, type BiliMessage, type GoogleContent, type GoogleRequestBody, type GoogleSystemInstruction, type GoogleTool } from "acp-kernel/wire";
 import type { ProxyOptions } from "../config.js";
+import { resolveTextSanitize, guardWireMessages } from "../text-sanitize.js";
 import { pluginAgentHeader } from "../plugin.js";
 import { currentCalibrationFactor } from "../util.js";
 import { diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, makeFoldPointReasoningDroppable, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, usageGradeInputBaseline, type Prepared } from "../server.js";
@@ -391,6 +392,8 @@ export async function prepareGoogle(
     }
 
     const rebuilt: GoogleRequestBody = { ...parsed, contents: rebuiltContents, tools: toolsOut, systemInstruction };
+    // 正文三道闸：Google wire 的出站兜底（上一轮漏接，本次补齐；contents 用 parts）。
+    guardWireMessages(rebuilt.contents, resolveTextSanitize(), log, sessionId);
     clampOutgoingOutput(rebuilt as Record<string, unknown>, "generationConfig.maxOutputTokens", { systemText: googleClientSystem, tools: toolsOut, processedMessages, lastInputTokens: session.stats.lastInputTokens, lastInputTokensSource: session.stats.lastInputTokensSource, nativeWindow, headroomWindow: config.modelContextLimit, imageTokens: imageReserveFor(session, "google", rebuilt, opts, upstreamOrigin), kFactor: currentCalibrationFactor(session.stats, session.metadata?.lastModel), kOrigin: session.stats.calibratedEstimateOrigin, origin: upstreamOrigin, ledgerFloorTokens: dshLedgerFloorTokens(session.metadata), knownOutputCeiling: resolveKnownOutputCeiling(req.headers, parsed as Record<string, unknown>, opts.routes, upstreamOrigin, opts.sessionHeader, model) }, sessionId, log, (c) => { session.stats.lastOutputClamp = { ...c, at: Date.now() }; });
     // #532: title-gen side requests carry their own tiny system — skip them.
     if (!isTitleGen && googleOutboundSystem !== undefined) {

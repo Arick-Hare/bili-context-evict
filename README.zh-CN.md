@@ -1,4 +1,27 @@
-# billion-context
+# bili-context-evict
+
+> **这不是原版项目。** 本仓库是
+> [ranxianglei/billion-context](https://github.com/ranxianglei/billion-context)
+> 的 fork，沿用 MIT 许可证，上游 `LICENSE` 与版权声明原样保留。
+>
+> 这个 fork 增加了：
+>
+> - **块级驱逐**：会话写了 `sleep.json`（「封盘」标记）且上下文水位过线后，
+>   边界之前的完整回合与已折叠的摘要块会被换成一行 `[evicted: …]` 标记。
+>   原文仍完整留在 `index.db`，只裁减发给模型的内存视图。
+> - **三个可选守卫，默认全部关闭** —— 见 [EVICT.md §2.1](./EVICT.md)：
+>   `textGuard.dropAssistantText`（下一轮请求体里不读回 assistant 正文）、
+>   `textGuard.sanitize`（剥掉出站正文里复述的输入形状与短周期循环）、
+>   `textGuard.cycleGuard`（识别「好.好.好.」这类短周期循环）。
+>   **除非你的 assistant 正文是永远不发给用户看的草稿，否则不要打开**：
+>   在普通聊天助手上打开，会把用户本该看到的话从请求体里删掉。
+>
+> 上游的修复**不会自动流进来**，需要手工合并。
+> XDG 目录名仍叫 `billion-context` 是**有意保留**的——改了会让所有旧会话索引失联。
+>
+> **安装提示**：`dist/` 不入库，请从本地 `file:` 路径或 `npm pack` 生成的 tgz 安装，
+> **不要直接从 GitHub 地址装**（那样拿到的是没有产物的源码）。下文的徽章与
+> `npm install -g billion-context` 是上游原文，指的是**官方包**，仅供对照。
 
 <p align="center"><a href="./README.md">English</a> | <a href="./README.zh-CN.md">中文</a></p>
 

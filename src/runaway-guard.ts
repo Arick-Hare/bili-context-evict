@@ -1,5 +1,6 @@
 import { ACP_NAME_ALT } from "./loop/tag-echo-filter.js";
 import { DEFAULT_TEXT_RUN_THRESHOLD, guardrailTextRunThreshold } from "./knobs.js";
+import { hasShortCycle, resolveTextSanitize, TEXT_DONE_MARK } from "./text-sanitize.js";
 
 // Runaway-enumeration intrinsic termination (#2346). One assistant message can
 // degenerate into hundreds of echoed markers (render tags / tool-call XML) with no
@@ -28,7 +29,7 @@ import { DEFAULT_TEXT_RUN_THRESHOLD, guardrailTextRunThreshold } from "./knobs.j
 
 export interface RunawayVerdict {
     tripped: boolean;
-    reason?: "acp-enumeration" | "tool-xml-flood" | "text-run";
+    reason?: "acp-enumeration" | "tool-xml-flood" | "text-run" | "text-cycle";
     detail?: {
         acpTags: number;
         toolXmlFragments: number;
@@ -133,6 +134,14 @@ export function createRunawayGuard(): RunawayGuard {
     // #3406: resolve the text-run threshold ONCE per guard — a stream keeps the
     // threshold it started with even if the knob flips mid-flight. 0 = lane off.
     const textRunThreshold = guardrailTextRunThreshold();
+    // 正文污染事故处方②：短周期循环 lane。「好.」「（停）」这类 2–4 字符循环
+    // 漏过 #3260 的单 codepoint lane；这里按累积窗口检测，命中即 abort 上游流。
+    // 阈值与出站净化共用 BILI_TEXT_SANITIZE_CYCLE_REPEATS；单独关用
+    // BILI_GUARDRAIL_TEXT_CYCLE=0。[[完]] 是约定的收尾暗号，见到就不再累积。
+    const textCycleCfg = resolveTextSanitize();
+    // 独立开关：textGuard.cycleGuard / BILI_GUARDRAIL_TEXT_CYCLE=1，默认关。
+    const textCycleEnabled = textCycleCfg.cycleGuard;
+    let cycleBuf = "";
     let pending = "";
     let acpTags = 0;
     let toolXml = 0;
@@ -228,21 +237,35 @@ export function createRunawayGuard(): RunawayGuard {
     // CODE POINT, so an astral character (emoji) counts as one unit, not two surrogates.
     const feedText = (text: string): RunawayVerdict => {
         if (tripped) return { tripped: true, reason: undefined, detail: detail() };
-        if (text.length === 0 || textRunThreshold <= 0) return { tripped: false };
-        for (const cp of text) {
-            if (cp === lastCp) {
-                textRun += 1;
-                if (textRun > maxTextRun) {
-                    maxTextRun = textRun;
-                    textRunChar = cp;
+        if (text.length === 0) return { tripped: false };
+        // #3260 的单 codepoint lane 优先：保住原有 "text-run" 判定语义，
+        // 不让新的短周期 lane 抢走单字符失控的 reason。
+        if (textRunThreshold > 0) {
+            for (const cp of text) {
+                if (cp === lastCp) {
+                    textRun += 1;
+                    if (textRun > maxTextRun) {
+                        maxTextRun = textRun;
+                        textRunChar = cp;
+                    }
+                } else {
+                    lastCp = cp;
+                    textRun = 1;
                 }
-            } else {
-                lastCp = cp;
-                textRun = 1;
+                if (textRun >= textRunThreshold) {
+                    tripped = true;
+                    return { tripped: true, reason: "text-run", detail: detail() };
+                }
             }
-            if (textRun >= textRunThreshold) {
+        }
+        // 多字符短周期 lane（「好.」「（停）」交替）。
+        if (textCycleEnabled) {
+            cycleBuf = (cycleBuf + text).slice(-1024);
+            const doneAt = cycleBuf.indexOf(TEXT_DONE_MARK);
+            if (doneAt >= 0) cycleBuf = cycleBuf.slice(0, doneAt);
+            if (hasShortCycle(cycleBuf, textCycleCfg.cycleMinRepeats)) {
                 tripped = true;
-                return { tripped: true, reason: "text-run", detail: detail() };
+                return { tripped: true, reason: "text-cycle", detail: detail() };
             }
         }
         return { tripped: false, detail: detail() };

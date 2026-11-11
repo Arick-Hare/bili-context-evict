@@ -6,7 +6,7 @@
  * 落点：~/.config/billion-context/evict-history.jsonl（和 billion-context.json
  * 同目录，UTF-8 无 BOM，见 paths.ts 的 configDir()）。
  *
- * 编码（2026-11-06 小洄报「reason 乱码」后改）：JSONL 落盘是**纯 ASCII**，
+ * 编码（2026-11-06 修复 reason 中文乱码后改）：JSONL 落盘是**纯 ASCII**，
  * 所有非 ASCII 字符写成 \uXXXX 转义。原因不是写坏了——原本就是合法 UTF-8，
  * JSON.parse 也能还原中文——而是 Windows 上 PowerShell 5.1 / 记事本 / 某些
  * 查看器按 GBK 解无 BOM 文件，中文就显示成乱码（billion-context.json 早踩过）。
@@ -34,6 +34,9 @@ export interface EvictHistoryEntry {
     trigger: "auto" | "manual";
     sessionId: string;
     evictedCount: number;
+    /** 拆分口径：落地回合范围数 / 摘要块数。旧记录没有这两个字段。 */
+    evictedTurns?: number;
+    evictedBlocks?: number;
     reclaimedTokens: number;
     beforeRatio: number | null;
     afterRatio: number | null;
@@ -110,6 +113,8 @@ export function recordEviction(input: EvictHistoryInput, opts: { file?: string; 
             trigger: input.trigger === "auto" ? "auto" : "manual",
             sessionId: String(input.sessionId ?? ""),
             evictedCount: finiteInt(input.evictedCount),
+            ...(Number.isFinite(input.evictedTurns) ? { evictedTurns: finiteInt(input.evictedTurns) } : {}),
+            ...(Number.isFinite(input.evictedBlocks) ? { evictedBlocks: finiteInt(input.evictedBlocks) } : {}),
             reclaimedTokens: finiteInt(input.reclaimedTokens),
             beforeRatio: finiteRatio(input.beforeRatio),
             afterRatio: finiteRatio(input.afterRatio),

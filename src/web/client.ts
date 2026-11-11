@@ -547,7 +547,7 @@ export const WEB_CLIENT = `(function () {
         if (tog) tog.textContent = locale === "zh-CN" ? "English" : "中文";
     }
 
-    const PAGES = ["overview", "sessions", "config", "updates", "connect", "logs", "blog"];
+    const PAGES = ["overview", "sessions", "config", "evict", "updates", "connect", "logs", "blog"];
     let current = "overview";
     let sessionsCache = [];
     // #1682: last overview alert payload — lets a dismiss re-render without refetching.
@@ -4986,7 +4986,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         const hq = qi < 0 ? "" : hash.slice(qi + 1);
         let name = "overview";
         let detailId = null;
-        const top = hbase.match(new RegExp("^#/(overview|config|updates|connect|logs|blog)$"));
+        const top = hbase.match(new RegExp("^#/(overview|config|evict|updates|connect|logs|blog)$"));
         if (top) {
             name = top[1];
             if (name === "logs" && hq) applyLogFilter(hq);
@@ -5010,6 +5010,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         if (name === "overview") loadOverview();
         else if (name === "sessions") loadSessions(detailId);
         else if (name === "config") loadConfig();
+        else if (name === "evict") { const b = $("evict-refresh"); if (b) b.click(); }
         else if (name === "updates") loadUpdates();
         else if (name === "blog") loadBlog(detailId);
         else if (name === "logs") loadLogs();
@@ -5235,6 +5236,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         // 深合并保存。所有 /__bili/* 端点都是 loopback-gated，与 config 页同源。
         (function wireEvictPanel() {
             const statusBox = $("evict-status-box");
+            const historyBox = $("evict-history-box");
             const resultBox = $("evict-result-box");
             const refreshBtn = $("evict-refresh");
             const nowBtn = $("evict-now");
@@ -5243,38 +5245,98 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             const saveNote = $("evict-save-note");
             const fromSleep = $("evict-boundary-from-sleep");
             const seqCheck = $("evict-seq-ref-check");
+            const budgetInput = $("evict-budget");
+            const targetInput = $("evict-target");
+            const dryRunBox = $("evict-dry-run");
+            const tgDrop = $("tg-drop-assistant-text");
+            const tgSanitize = $("tg-sanitize");
+            const tgCycle = $("tg-cycle-guard");
+            const tgMaxChars = $("tg-max-chars");
+            const tgCycleRepeats = $("tg-cycle-repeats");
+            const sessionList = $("evict-session-list");
+            const selectAllBtn = $("evict-select-all");
+            const selectNoneBtn = $("evict-select-none");
             if (!statusBox) return;
+            const checkedSessions = () => Array.from(document.querySelectorAll(".evict-session-check:checked")).map((el) => el.value);
 
             const fmtPct = (v) => (typeof v === "number" && isFinite(v) ? (v * 100).toFixed(1) + "%" : "—");
             const fmtNum = (v) => (typeof v === "number" ? v.toLocaleString() : "—");
             function renderStatus(s) {
                 if (!s || s.ok === false) {
-                    statusBox.textContent = "驱逐状态不可用：" + ((s && s.error) || "无响应");
+                    statusBox.innerHTML = '<div class="dim small">驱逐状态不可用：' + ((s && s.error) || "无响应") + "</div>";
                     return;
                 }
                 const cfg = s.config || {};
                 const mk = s.marker || {};
-                const lines = [];
-                lines.push("index.db 只读视图：" + (s.dbAvailable ? "可用" : "不可用（块候选/查库回落会关闭）"));
-                lines.push("驱逐：" + (cfg.enabled ? "开" : "关") + "  budget=" + fmtPct(cfg.budget) + "  target=" + fmtPct(cfg.target) + "  dryRun=" + (cfg.dryRun ? "true" : "false"));
-                lines.push("配置：boundaryFromSleep=" + (cfg.boundaryFromSleep === false ? "false（按水位）" : "true") + "  seqRefCheck=" + (cfg.seqRefCheck || "strict"));
-                lines.push("sleep.json：sessionId=" + (mk.sessionId || "缺（老文件）") + "  boundary=" + (mk.boundary || "—") + "  boundarySeq=" + (mk.boundarySeq ?? "—") + "  at=" + (mk.at || "—"));
+                const esc = (v) => String(v === undefined || v === null ? "—" : v).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+                const rows = [];
+                const fmtLocal = (iso) => {
+                    const d = new Date(iso);
+                    if (isNaN(d.getTime())) return esc(iso);
+                    const p = (n) => String(n).padStart(2, "0");
+                    return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()) + " " + p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
+                };
+                const push = (k, v) => rows.push('<div class="k">' + k + '</div><div class="v">' + v + '</div>');
+                push("index.db", s.dbAvailable ? "可用" : '<span style="color:#cf222e">不可用（块候选/查库回落关闭）</span>');
+                push("驱逐", (cfg.enabled ? "开" : "关") + " · budget " + fmtPct(cfg.budget) + " · target " + fmtPct(cfg.target) + " · dryRun " + (cfg.dryRun ? "true" : "false"));
+                push("配置", "boundaryFromSleep=" + (cfg.boundaryFromSleep === false ? "false（按水位）" : "true") + " · seqRefCheck=" + (cfg.seqRefCheck || "strict"));
+                push("sleep.json", "sessionId=" + esc(mk.sessionId || "缺（老文件）") + " · boundary=" + esc(mk.boundary) + " · boundarySeq=" + esc(mk.boundarySeq) + " · at=" + fmtLocal(mk.at));
+                const fmtEvicted = (e) => (typeof e.evictedTurns === "number" || typeof e.evictedBlocks === "number")
+                    ? "扔 " + fmtNum(e.evictedTurns || 0) + " 回合 + " + fmtNum(e.evictedBlocks || 0) + " 块"
+                    : "扔 " + fmtNum(e.evictedCount || 0);
                 const last = s.lastEviction;
-                lines.push("上次驱逐：" + (last
-                    ? (last.at || "—") + " · " + (last.trigger || "—") + " · 扔 " + (last.evictedCount ?? 0)
+                push("上次驱逐", last
+                    ? fmtLocal(last.at) + " · " + (last.trigger || "—") + " · " + fmtEvicted(last)
                         + " · 回收 " + fmtNum(last.reclaimedTokens) + " tok · " + fmtPct(last.beforeRatio) + " → " + fmtPct(last.afterRatio)
-                    : "无记录"));
-                for (const row of (s.sessions || [])) {
-                    lines.push("");
-                    lines.push("会话 " + row.id + (row.loaded ? "" : "（未加载）"));
-                    lines.push("  消息条数=" + fmtNum(row.messageCount) + "  contextTokens=" + fmtNum(row.contextTokens));
-                    lines.push("  睡眠闸门：" + (row.gateOpen ? "开" : "关") + (row.gateReason ? "  reason=" + row.gateReason : "") + (row.gateHow ? "  how=" + row.gateHow : ""));
-                    lines.push("  boundary=" + (row.boundary || "—") + "  seq=" + (row.boundarySeq ?? "—") + "  来源=" + (row.boundarySource || "—"));
-                    if (row.migrationWarning) lines.push("  ⚠ " + row.migrationWarning);
+                    : "无记录");
+                if (historyBox) {
+                    const hist = Array.isArray(s.recentEvictions) ? s.recentEvictions : [];
+                    historyBox.innerHTML = hist.length === 0
+                        ? '<span class="dim small">暂无记录</span>'
+                        : hist.map((e) => '<div class="mono small" style="padding:4px 0;border-bottom:1px solid rgba(127,127,127,.2)">'
+                            + esc(fmtLocal(e.at)) + " · " + esc(e.trigger || "—") + " · " + esc(fmtEvicted(e))
+                            + " · 回收 " + fmtNum(e.reclaimedTokens) + " tok · " + fmtPct(e.beforeRatio) + " → " + fmtPct(e.afterRatio)
+                            + (e.dryRun ? " · 预演" : "") + "</div>").join("");
                 }
-                statusBox.textContent = lines.join("\n");
+                for (const row of (s.sessions || [])) {
+                    rows.push('<div class="k" style="padding-top:12px">会话</div><div class="v mono" style="padding-top:12px">' + esc(row.id) + (row.loaded ? "" : "（未加载）") + '</div>');
+                    push("消息", fmtNum(row.messageCount) + " 条 · contextTokens " + fmtNum(row.contextTokens));
+                    push("闸门", (row.gateOpen ? '<span style="color:#1a7f37">开</span>' : '<span style="color:#cf222e">关</span>') + (row.gateReason ? " · " + esc(row.gateReason) : "") + (row.gateHow ? " · how=" + esc(row.gateHow) : ""));
+                    push("boundary", esc(row.boundary) + " · seq " + esc(row.boundarySeq) + " · 来源 " + esc(row.boundarySource));
+                    if (row.migrationWarning) push("⚠", esc(row.migrationWarning));
+                }
+                statusBox.innerHTML = '<dl class="kv">' + rows.join("") + '</dl>';
                 if (fromSleep) fromSleep.checked = cfg.boundaryFromSleep !== false;
                 if (seqCheck) seqCheck.value = cfg.seqRefCheck || "strict";
+                if (budgetInput) budgetInput.value = typeof cfg.budget === "number" ? String(cfg.budget) : "";
+                if (targetInput) targetInput.value = typeof cfg.target === "number" ? String(cfg.target) : "";
+                if (dryRunBox) dryRunBox.checked = cfg.dryRun === true;
+                if (sessionList) {
+                    const avail = Array.isArray(s.availableSessions) ? s.availableSessions : [];
+                    const sel = Array.isArray(cfg.sessions) ? cfg.sessions : [];
+                    const allSelected = sel.includes("*");
+                    const detail = new Map((Array.isArray(s.sessions) ? s.sessions : []).map((r) => [r.id, r]));
+                    if (!avail.length) {
+                        sessionList.innerHTML = '<span class="dim small">进程里没有活跃会话（打开一条会话后刷新）</span>';
+                    } else {
+                        sessionList.innerHTML = avail.map((row) => {
+                            const d = detail.get(row.id) || {};
+                            const on = allSelected || sel.includes(row.id);
+                            const tail = d.loaded === false ? '<span class="dim"> · 未加载</span>' : "";
+                            const gate = d.gateOpen === true
+                                ? '<span style="color:#1a7f37">开</span>'
+                                : d.gateOpen === false
+                                    ? '<span style="color:#cf222e">关</span>' + (d.gateReason ? ' · ' + esc(d.gateReason) : '')
+                                    : '<span class="dim">未检查</span>';
+                            const meta = typeof d.messageCount === "number"
+                                ? '<br><span class="dim small">' + fmtNum(d.messageCount) + ' 条消息 · ' + fmtNum(d.contextTokens) + ' tok · 闸门' + gate + '</span>'
+                                : '';
+                            return '<label style="display:flex;align-items:flex-start;gap:8px;font-size:13px;cursor:pointer">'
+                                + '<input type="checkbox" class="evict-session-check" value="' + esc(row.id) + '"' + (on ? " checked" : "") + ' style="margin-top:3px">'
+                                + '<span><span class="mono">' + esc(row.id) + '</span>' + tail + meta + '</span></label>';
+                        }).join("");
+                    }
+                }
             }
             async function refreshStatus() {
                 try { renderStatus(await json(API_ROOT + "/evict-status")); }
@@ -5286,6 +5348,8 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
                 busy(btn, true);
                 try {
                     const body = dryRun ? { dryRun: true } : {};
+                    const picked = checkedSessions();
+                    if (picked.length > 0) body.sessions = picked;
                     const r = await json(API_ROOT + "/evict-now", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
                     const lines = [];
                     lines.push(dryRun ? "【dryRun，未写回】" : "【已执行】");
@@ -5297,14 +5361,34 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
                         const cs = it.blockCandidates || [];
                         lines.push("  候选块 " + cs.length + " 个" + (cs.length ? "：" + cs.slice(0, 8).map((c) => c.id + "(" + c.chars + "字 seq " + c.startSeq + ".." + c.endSeq + ")").join("、") : ""));
                     }
-                    if (resultBox) { resultBox.textContent = lines.join("\n"); resultBox.hidden = false; }
+                    if (resultBox) { resultBox.textContent = lines.join(String.fromCharCode(10)); resultBox.hidden = false; }
                     refreshStatus();
                 } catch (e) {
                     if (resultBox) { resultBox.textContent = "请求失败：" + e.message; resultBox.hidden = false; }
                 } finally { busy(btn, false); }
             }
-            // 4.4 深合并：读整份 raw → 只改 evict 的两个键 → 用 whole-file PUT
-            // 写回。服务端 handleConfigPut 也会把未知键深合并回来，双保险。
+            // 正文守卫三个开关不在 evict-status 的 config 里，要从整份配置文件的
+            // raw 读（与保存时同源）。默认全关，读不到就保持不勾。
+            async function loadTextGuard() {
+                try {
+                    const cfg = await json(API_ROOT + "/config");
+                    const raw = typeof cfg.raw === "string" && cfg.raw.trim() ? cfg.raw : "{}";
+                    let obj = {};
+                    try { obj = JSON.parse(raw); } catch { obj = {}; }
+                    const tg = obj && typeof obj === "object" && obj.textGuard && typeof obj.textGuard === "object" && !Array.isArray(obj.textGuard)
+                        ? obj.textGuard : {};
+                    if (tgDrop) tgDrop.checked = tg.dropAssistantText === true;
+                    if (tgSanitize) tgSanitize.checked = tg.sanitize === true;
+                    if (tgCycle) tgCycle.checked = tg.cycleGuard === true;
+                    if (tgMaxChars) tgMaxChars.value = typeof tg.maxChars === "number" ? String(tg.maxChars) : "";
+                    if (tgCycleRepeats) tgCycleRepeats.value = typeof tg.cycleMinRepeats === "number" ? String(tg.cycleMinRepeats) : "";
+                } catch (e) {
+                    if (saveNote) saveNote.textContent = "读取正文守卫配置失败：" + e.message;
+                }
+            }
+
+            // 4.4 深合并：读整份 raw → 只改 evict / textGuard 两个段 → 用
+            // whole-file PUT 写回。服务端 handleConfigPut 也会把未知键深合并回来。
             async function saveEvictConfig() {
                 if (!saveBtn) return;
                 busy(saveBtn, true);
@@ -5315,24 +5399,56 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
                     try { obj = JSON.parse(raw); } catch (e) { throw new Error("当前配置文件不是合法 JSON，拒绝保存：" + e.message); }
                     if (!obj || typeof obj !== "object" || Array.isArray(obj)) obj = {};
                     const oldEvict = obj.evict && typeof obj.evict === "object" && !Array.isArray(obj.evict) ? obj.evict : {};
+                    const budget = budgetInput ? Number(budgetInput.value) : NaN;
+                    const target = targetInput ? Number(targetInput.value) : NaN;
+                    if (Number.isFinite(budget) && !(budget > 0 && budget < 1)) throw new Error("budget 要在 0 和 1 之间");
+                    if (Number.isFinite(target) && !(target > 0 && target < 1)) throw new Error("target 要在 0 和 1 之间");
+                    const picked = checkedSessions();
+                    const allIds = Array.from(document.querySelectorAll(".evict-session-check")).map((el) => el.value);
+                    const sessions = picked.length > 0 && picked.length === allIds.length ? ["*"] : picked;
                     obj.evict = {
                         ...oldEvict,
+                        ...(Number.isFinite(budget) ? { budget } : {}),
+                        ...(Number.isFinite(target) ? { target } : {}),
+                        dryRun: dryRunBox ? dryRunBox.checked : false,
                         boundaryFromSleep: fromSleep ? fromSleep.checked : true,
                         seqRefCheck: seqCheck ? seqCheck.value : "strict",
+                        sessions,
+                    };
+                    const oldTg = obj.textGuard && typeof obj.textGuard === "object" && !Array.isArray(obj.textGuard) ? obj.textGuard : {};
+                    const maxChars = tgMaxChars ? Number(tgMaxChars.value) : NaN;
+                    const cycleRepeats = tgCycleRepeats ? Number(tgCycleRepeats.value) : NaN;
+                    if (tgMaxChars && tgMaxChars.value.trim() && !(Number.isFinite(maxChars) && maxChars >= 100)) throw new Error("maxChars 要是不小于 100 的整数");
+                    if (tgCycleRepeats && tgCycleRepeats.value.trim() && !(Number.isFinite(cycleRepeats) && cycleRepeats >= 2)) throw new Error("cycleMinRepeats 要是不小于 2 的整数");
+                    obj.textGuard = {
+                        ...oldTg,
+                        dropAssistantText: tgDrop ? tgDrop.checked : false,
+                        sanitize: tgSanitize ? tgSanitize.checked : false,
+                        cycleGuard: tgCycle ? tgCycle.checked : false,
+                        ...(Number.isFinite(maxChars) && maxChars >= 100 ? { maxChars: Math.floor(maxChars) } : {}),
+                        ...(Number.isFinite(cycleRepeats) && cycleRepeats >= 2 ? { cycleMinRepeats: Math.floor(cycleRepeats) } : {}),
                     };
                     await json(API_ROOT + "/config", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ file: JSON.stringify(obj, null, 2) }) });
                     if (saveNote) saveNote.textContent = "已保存（深合并，其余键原样保留）";
                     loadConfig();
                     refreshStatus();
+                    loadTextGuard();
                 } catch (e) {
                     if (saveNote) saveNote.textContent = "保存失败：" + e.message;
                 } finally { busy(saveBtn, false); }
             }
             if (refreshBtn) refreshBtn.addEventListener("click", refreshStatus);
+            if (selectAllBtn) selectAllBtn.addEventListener("click", () => {
+                document.querySelectorAll(".evict-session-check").forEach((el) => { el.checked = true; });
+            });
+            if (selectNoneBtn) selectNoneBtn.addEventListener("click", () => {
+                document.querySelectorAll(".evict-session-check").forEach((el) => { el.checked = false; });
+            });
             if (nowBtn) nowBtn.addEventListener("click", () => runEviction(false));
             if (previewBtn) previewBtn.addEventListener("click", () => runEviction(true));
             if (saveBtn) saveBtn.addEventListener("click", saveEvictConfig);
             refreshStatus();
+            loadTextGuard();
         })();
         document.addEventListener("click", (ev) => {
             const target = ev.target;

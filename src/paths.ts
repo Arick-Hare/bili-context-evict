@@ -57,6 +57,16 @@ export function stateDir(): string {
     return path.join(xdg("XDG_STATE_HOME", ".local/state"), "billion-context");
 }
 
+/** Root dir for the eviction feature (sleep markers, archives, optional
+ *  memory diagnostics). Deliberately INDEPENDENT of any host-specific memory
+ *  layout: the plugin must be usable without an external memory system.
+ *  Override with BILI_EVICT_ROOT (tests / containers / shared installs). */
+export function evictRoot(): string {
+    const env = process.env.BILI_EVICT_ROOT;
+    if (env && env.length > 0) return path.resolve(env);
+    return path.join(configDir(), "evict");
+}
+
 /** Default log file path. */
 export function defaultLogFile(): string {
     return path.join(stateDir(), "bili.log");

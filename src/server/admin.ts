@@ -217,7 +217,14 @@ function buildEvictStatus(): Record<string, unknown> {
     const evict = resolveEvictConfig(loadConfigFile().evict, process.env);
     const db = openEvictDb();
     const sessions = (evict.sessions ?? []).map((s) => s.split("|sub:")[0]);
-    const history = readEvictionHistory(1)[0] as unknown as Record<string, unknown> | undefined;
+    // 自动 lane 每个请求都写一条历史（含 evictedCount=0 的「只裁工具结果」轮）。
+    // 只看最新 1 条会把真正扔了 51 块的那条顶掉；连「裁了工具结果」也算有效
+    // 同样会把它挤出前 5。所以只列 evictedCount>0 的轮次，取最近 5 条。
+    const pool = readEvictionHistory(100);
+    const recentEvictions = pool
+        .filter((e) => typeof e.evictedCount === "number" && e.evictedCount > 0)
+        .slice(0, 5);
+    const history = recentEvictions[0] as unknown as Record<string, unknown> | undefined;
     const perSession = [...new Set(sessions.filter((s) => s !== "*"))].map((sid) => {
         const session = getSession(sid);
         const gate = session
@@ -263,6 +270,7 @@ function buildEvictStatus(): Record<string, unknown> {
         marker: perSession.length > 0 ? perSession[0]!.marker ?? null : null,
         sessions: perSession,
         lastEviction: history ?? null,
+        recentEvictions,
     };
 }
 
@@ -351,6 +359,7 @@ async function handleEvictNow(
                         }
                         : undefined,
                     seqRefCheck: evict.seqRefCheck,
+                    refMismatchAllow: new Set(evict.refMismatchAllow ?? []),
                 },
             ).units.map((u) => ({ id: u.blockId, chars: u.summaryChars, startSeq: u.startSeq, endSeq: u.endSeq }));
             if (evicted) {
@@ -367,13 +376,16 @@ async function handleEvictNow(
                 if (!evict.dryRun) {
                     recordEviction({
                         trigger: "manual", sessionId: base,
-                        evictedCount: evicted.evictedCount, reclaimedTokens: evicted.reclaimedTokens,
+                        evictedCount: evicted.evictedCount,
+                        evictedTurns: evicted.evictedTurns, evictedBlocks: evicted.evictedBlocks,
+                        reclaimedTokens: evicted.reclaimedTokens,
                         beforeRatio, afterRatio, dryRun: evict.dryRun, reason: "",
                         tokensSource, snapshotAgeMs,
                     });
                 }
                 results.push({
                     id: base, evictedCount: evicted.evictedCount,
+                    evictedTurns: evicted.evictedTurns, evictedBlocks: evicted.evictedBlocks,
                     reclaimedTokens: evicted.reclaimedTokens, beforeRatio, afterRatio,
                     dryRun: evict.dryRun, viewSource, blockCandidates: blockPreview,
                 });

@@ -1,36 +1,30 @@
 /**
  * 睡眠闸门（sleep.json）：驱逐对话原文的唯一开关。
  *
- * 设计（《驱逐插件-小洄的想法》）：
- *  - 「睡着」= 当天已经道晚安、记忆写完、handoff 已经归档出文件；由人写
- *    `~/.dsh/heart/sleep.json` 作为唯一凭据。
- *  - boundary 是睡前最后一条消息的 ref（如 `m09162`），插件在消息数组里找它，
- *    切在它前面：boundary 之前 = 已封盘，可以整段丢；之后一根汗毛不动。
- *  - tail 是那条消息前 ~30 字，ref 失效（重放 / 换会话 / ref 号重置）时靠它认。
- *  - 两个都找不到，就完全不动 —— 宁可少丢，不能丢错。
- *  - archived 指向 handoff 产出的归档文件，必须存在且非空，否则不认这个标记。
+ * 这是本插件唯一的「人/外部系统确认」接口，与任何记忆系统的实现无关：
+ *  - 「封盘」= 边界之前的对话原文已经在你自己的存储里留了底。写一份
+ *    per-session `sleep.json` 作为凭据，插件才允许驱逐那之前的原文。
+ *  - `boundarySeq` 是封盘线的 seq（优先），或 `boundary` 的 `mNNNNN` 由
+ *    `index.db` 按 session_id 换算。切在它前面：之前可整段丢，之后不动。
+ *  - `archived` 指向归档文件（相对 archiveRoot），必须存在、是文件、非空，
+ *    且不能跳出归档根；否则不认这个标记。
+ *  - `tail` 是边界消息前 ~30 字，仅作诊断/旧视图定位，不能当封盘线。
+ *  - 任何一项缺失或校验不过 → 关闸门，完全不动。宁可少丢，不能丢错。
  *
- * 补丁二（2026-11-08）：`boundarySeq` 优先（seq 单调递增、永不重编号），
- *  没有则用 `boundary` 的 mNNNNN 查 index.db 换 seq（**必须带 session_id**）。
- *  reason 分级：不再把所有失败合成一句「找不到」。
+ * 路径全部走 `evictRoot()`（XDG_CONFIG_HOME / BILI_EVICT_ROOT），不依赖
+ * 宿主私有的记忆目录。旧的 `~/.dsh/heart/sleep.json` 只在一次性迁移时读。
  *
- * 会话隔离方案（2026-11-08 晚，针对 19:35 那次事故）：
- *  - 根因：单份全局 sleep.json + 只比一次 sessionId，新会话会拿旧会话的
- *    boundarySeq 当边界 → 自己所有块都在边界之前 → 每轮都判「全都能扔」。
- *  - 改为**每会话一份** marker：`configDir()/sessions/<sessionId>/sleep.json`。
- *    读不到就关闸门（`no-session-marker`），**不回落全局文件**；身份由文件
- *    位置保证，不再靠 marker.sessionId 字段猜。
- *  - `boundarySeq > 该会话 max(seq)` → 关闸门（`boundary-beyond-session`），
- *    写 warn 带上两个数。
- *  - 启动时一次性迁移：全局 `~/.dsh/heart/sleep.json` 复制到旧会话目录，
- *    原文件改名 `.migrated-<日期>` 不删。
+ * 会话隔离（2026-11-08，针对一次「新会话拿旧边界」事故）：
+ *  - 每会话一份 marker：`<evictRoot>/sessions/<sessionId>/sleep.json`；
+ *    读不到就关闸门（`no-session-marker`），**不回落全局文件**。
+ *  - `boundarySeq > 该会话 max(seq)` → 关闸门（`boundary-beyond-session`）。
  */
 import { existsSync, readFileSync, statSync, mkdirSync, copyFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import type { CompressionState, CoreMessage } from "acp-kernel";
 import type { EvictDbView } from "./evict-db.js";
-import { configDir } from "./paths.js";
+import { evictRoot } from "./paths.js";
 
 export interface SleepMarker {
   /** ISO 时间，写标记的时刻。 */
@@ -47,7 +41,7 @@ export interface SleepMarker {
   tail?: string;
   /** 归档对应的日期（`2026-11-02`）。 */
   day?: string;
-  /** handoff 归档文件，相对 stt 根。 */
+  /** 归档文件，相对 archiveRoot（默认 `<evictRoot>/archive`）。必须存在、是文件、非空。 */
   archived?: string;
 }
 
@@ -71,6 +65,9 @@ export interface SleepGateResult {
 
 export interface SleepGateOpts {
   sleepFile?: string;
+  /** 归档根目录（推荐名）。 */
+  archiveRoot?: string;
+  /** @deprecated 用 archiveRoot；保留以兼容旧配置。 */
   sttRoot?: string;
   /** 当前会话 id（会话隔离：决定读哪个目录的 marker，并对账 max(seq)）。 */
   sessionId?: string;
@@ -94,24 +91,35 @@ function expandHome(p: string): string {
   return t;
 }
 
+/** 仅用于兼容旧部署的一次性迁移；新代码不得把它当默认路径。 */
 export function dshHomeDir(): string {
   const env = process.env.DSH_HOME?.trim();
   return env ? path.resolve(expandHome(env)) : path.join(homedir(), ".dsh");
 }
 
-export function sleepFilePath(explicit?: string): string {
-  const p = explicit?.trim();
-  if (p) return path.resolve(expandHome(p));
+/** 旧的私有部署全局 marker 路径（迁移源）。 */
+export function legacySleepFilePath(): string {
   return path.join(dshHomeDir(), "heart", "sleep.json");
 }
 
 /**
- * 会话隔离：每会话一份 marker 的路径。
- * `configDir()/sessions/<sessionId>/sleep.json`（XDG 感知，不写死盘符/用户）。
+ * 通用部署的全局 marker 路径：`<evictRoot>/sleep.json`。
+ * 只是「全局」入口；闸门实际读的是 per-session 文件，见 sleepMarkerPath。
+ */
+export function sleepFilePath(explicit?: string): string {
+  const p = explicit?.trim();
+  if (p) return path.resolve(expandHome(p));
+  return path.join(evictRoot(), "sleep.json");
+}
+
+/**
+ * 会话隔离：每会话一份 marker。
+ * `<evictRoot>/sessions/<sessionId>/sleep.json`（XDG 感知，不写死盘符/用户，
+ * 也不依赖任何宿主私有目录）。
  */
 export function sleepMarkerPath(sessionId: string): string {
   const sid = String(sessionId ?? "").trim();
-  return path.join(configDir(), "sessions", sid, "sleep.json");
+  return path.join(evictRoot(), "sessions", sid, "sleep.json");
 }
 
 /** 只读该会话的 marker；目录或文件不存在返回 null（关闸门依据）。 */
@@ -129,22 +137,28 @@ export function atomicWriteJson(file: string, obj: unknown): void {
 
 let migrationDone = false;
 /**
- * 会话隔离·迁移：把旧的全局 `~/.dsh/heart/sleep.json` 一次性复制到对应会话
- * 目录，原文件改名 `.migrated-<日期>` 不删。模块级只跑一次。
- *  - marker 有 sessionId → 复制到 `<configDir>/sessions/<sessionId>/sleep.json`；
- *  - 无 sessionId（极老文件）→ 放进 `<configDir>/sessions/_legacy/`，不参与驱逐；
- *  - 目标已存在 → 不覆盖，只把全局文件改名让路；
- *  - 全局文件不存在 → 什么都不做（直接用 per-session 文件）。
+ * 一次性迁移：把「全局」sleep.json 收编成 per-session marker，原文件改名
+ * `.migrated-<日期>` 不删。模块级只跑一次，读不到任何来源就什么都不做。
+ *
+ * 来源优先级：显式配置路径 → 通用全局 `<evictRoot>/sleep.json` → 旧私有部署
+ * `~/.dsh/heart/sleep.json`（仅为兼容，插件本身不再依赖该目录）。
+ *  - 有 sessionId → 收编到该会话目录；无 → `_legacy/`，不参与驱逐。
+ *  - 目标已存在 → 不覆盖，只把来源文件改名让路。
  */
 export function ensureSleepMigration(evict: { sleepFile?: string }, log?: (msg: string) => void): void {
   if (migrationDone) return;
   migrationDone = true;
-  const global = sleepFilePath(evict.sleepFile);
-  if (!existsSync(global)) return;
+  const candidates = [
+    evict.sleepFile?.trim() ? path.resolve(expandHome(evict.sleepFile)) : "",
+    sleepFilePath(),
+    legacySleepFilePath(),
+  ].filter((p) => p !== "");
+  const global = candidates.find((p) => existsSync(p) && readSleepMarker(p) !== null);
+  if (!global) return;
   const marker = readSleepMarker(global);
   const sid = typeof marker?.sessionId === "string" && marker.sessionId.trim() !== "" ? marker.sessionId.trim() : "_legacy";
-  const dir = path.join(configDir(), "sessions", sid);
-  const target = path.join(dir, "sleep.json");
+  const target = sleepMarkerPath(sid);
+  const dir = path.dirname(target);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   if (existsSync(target)) {
     // 该会话已有 per-session marker（用户新建的），不要覆盖，只把全局文件让路。
@@ -171,16 +185,27 @@ function safeRenameAway(file: string): void {
   }
 }
 
-/** stt 根：桌面 profile 下的 stt（say.mjs / daily / old-session 都在那里）。 */
-export function sttRootDir(explicit?: string): string {
+/**
+ * 归档根：sleep.json 里 `archived` 相对路径的基准。
+ * 默认 `<evictRoot>/archive`，与宿主无关；显式 archiveRoot/sttRoot 优先。
+ * 旧私有部署的 `profiles/desktop/stt` 仅在确实存在时作兼容回退，插件不依赖它。
+ */
+export function archiveRootDir(explicit?: string): string {
   const p = explicit?.trim();
   if (p) return path.resolve(expandHome(p));
+  const generic = path.join(evictRoot(), "archive");
+  if (existsSync(generic)) return generic;
   const home = dshHomeDir();
-  const candidates = [
+  const legacy = [
     path.join(home, "profiles", "desktop", "stt"),
     path.join(home, "stt"),
-  ];
-  return candidates.find((c) => existsSync(c)) ?? candidates[0]!;
+  ].find((c) => existsSync(c));
+  return legacy ?? generic;
+}
+
+/** @deprecated 用 archiveRootDir；保留名字以兼容已有配置与调用方。 */
+export function sttRootDir(explicit?: string): string {
+  return archiveRootDir(explicit);
 }
 
 export function readSleepMarker(file: string): SleepMarker | null {
@@ -198,10 +223,10 @@ function normalizeArchived(p: string): string {
   return p
     .replace(/\\/g, "/")
     .replace(/^\.\//, "")
-    .replace(/^stt\//, "");
+    .replace(/^(?:archive|archives|stt)\//, "");
 }
 
-/** archived 必须存在、是文件、size>0，且不能跳出 stt 根。 */
+/** archived 必须存在、是文件、size>0，且不能跳出归档根。 */
 export function verifyArchive(sttRoot: string, archived?: string): string | null {
   if (!archived || !archived.trim()) return null;
   const root = path.resolve(sttRoot);
@@ -419,7 +444,10 @@ export function checkSleepGate(
       reason: `没有该会话的 sleep.json（${sleepMarkerPath(sid)}），还没封盘，闸门关闭（no-session-marker）`,
     };
   }
-  const archivedAbs = verifyArchive(sttRootDir(opts.sttRoot), marker.archived);
+  const archivedAbs = verifyArchive(
+    archiveRootDir(opts.archiveRoot ?? opts.sttRoot),
+    marker.archived,
+  );
   if (!archivedAbs) {
     return {
       ok: false,

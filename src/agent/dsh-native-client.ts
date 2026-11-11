@@ -98,12 +98,13 @@ const SLOW_POLL_INTERVAL_MS = 10000;
 // the master-pulled 博客 sits next to 版本 in the dsh bili设置 tab bar; an
 // older embedded frame without the #/blog route falls back to its own
 // default page inside the iframe (no blank pane).
-const PAGE_IDS = ["overview", "sessions", "config", "logs", "updates", "blog"] as const;
+const PAGE_IDS = ["overview", "sessions", "config", "evict", "logs", "updates", "blog"] as const;
 type PageId = (typeof PAGE_IDS)[number];
 const PAGE_KEYS: Record<PageId, string> = {
     overview: "tab_overview",
     sessions: "tab_sessions",
     config: "tab_config",
+    evict: "tab_evict",
     logs: "tab_logs",
     updates: "tab_updates",
     blog: "tab_blog",
@@ -149,6 +150,11 @@ const ctxStatusPathFor = (hostSessionId: string | undefined): string =>
         ? CTX_STATUS_PATH
         : `/__bili/plugin/status?conversationId=${encodeURIComponent(hostSessionId)}&fallback=latest`;
 const CTX_POLL_MS = 10000;
+// #evict-page: the settings frame is keyed once per app launch. A bare
+// ?embed=1 URL can be served from the renderer's cache across a plugin
+// upgrade, which shows a stale page even though the backend already serves
+// the new one. Keying the URL per process forces a fresh fetch.
+const FRAME_STAMP = String(Date.now());
 // #4254: frame-level upstream-unavailable pill (shell.overlay) — same slow cadence
 // as the per-session Context tab. A dead circuit retries on its own ~60s probe, so
 // 10s keeps the "retry in ~Ns" hint fresh and clears the banner within one tick.
@@ -494,6 +500,7 @@ const zh: Dict = {
     "tab_overview": "总览",
     "tab_sessions": "会话",
     "tab_config": "配置",
+    "tab_evict": "驱逐",
     "tab_logs": "日志",
     "tab_updates": "版本",
     "tab_blog": "博客",
@@ -523,6 +530,7 @@ const en: Dict = {
     "tab_overview": "Overview",
     "tab_sessions": "Sessions",
     "tab_config": "Config",
+    "tab_evict": "Evict",
     "tab_logs": "Logs",
     "tab_updates": "Versions",
     "tab_blog": "Blog",
@@ -861,7 +869,7 @@ export function apply(ctx: ClientContext): void {
             middle = createElement(
                 "iframe",
                 {
-                    src: `${origin}/__bili/?embed=1&lang=${lang}${theme !== undefined ? `&theme=${theme}` : ""}#/session/${encodeURIComponent(sessionId)}`,
+                    src: `${origin}/__bili/?embed=1&lang=${lang}${theme !== undefined ? `&theme=${theme}` : ""}&v=${FRAME_STAMP}#/session/${encodeURIComponent(sessionId)}`,
                     title: t("title"),
                     style: {
                         display: "block",
@@ -916,9 +924,9 @@ export function apply(ctx: ClientContext): void {
             ),
         );
     };
-    const panel = (titled: boolean): ((props: Record<string, unknown>) => unknown) => () => {
+    const panel = (titled: boolean, initial: PageId = "overview", only?: PageId): ((props: Record<string, unknown>) => unknown) => () => {
         const [origin, setOrigin] = useState<string | undefined>(readOrigin());
-        const [page, setPage] = useState<PageId>("overview");
+        const [page, setPage] = useState<PageId>(initial);
         // #2559: synchronous first paint — the very first render already pins
         // the palette to the host's current ground (no wrong-scheme flash).
         const [theme, setTheme] = useState<("light" | "dark") | undefined>(detectHostTheme);
@@ -993,6 +1001,20 @@ export function apply(ctx: ClientContext): void {
             middle = renderRemoteBlock(t, origin, errorBox(liveEmbedError));
         } else if (liveEmbed === "stale") {
             middle = createElement("p", { style: { margin: 0, opacity: 0.7, lineHeight: 1.6 } }, t("stale"));
+        } else if (liveEmbed === "ok" && only !== undefined) {
+            // #5001: dedicated settings section — one page, no tab row.
+            middle = createElement("iframe", {
+                src: `${origin}/__bili/?embed=1&lang=${lang}${theme ? `&theme=${theme}` : ""}&v=${FRAME_STAMP}#/${only}`,
+                title: t("title"),
+                style: {
+                    display: "block",
+                    width: "100%",
+                    height: EMBED_HEIGHT,
+                    border: "1px solid rgba(127,127,127,0.4)",
+                    borderRadius: 8,
+                    background: "transparent",
+                },
+            });
         } else if (liveEmbed === "ok") {
             middle = createElement(
                 "div",
@@ -1029,7 +1051,7 @@ export function apply(ctx: ClientContext): void {
                     openWebButton(origin, t, { marginLeft: "auto", fontSize: "13", lineHeight: "20px", padding: "4px 14px" }),
                 ),
                 createElement("iframe", {
-                    src: `${origin}/__bili/?embed=1&lang=${lang}${theme ? `&theme=${theme}` : ""}#/${page}`,
+                    src: `${origin}/__bili/?embed=1&lang=${lang}${theme ? `&theme=${theme}` : ""}&v=${FRAME_STAMP}#/${page}`,
                     title: t("title"),
                     style: {
                         display: "block",
@@ -1052,7 +1074,7 @@ export function apply(ctx: ClientContext): void {
         return createElement(
             "div",
             { style: { display: "flex", flexDirection: "column", gap: 12, padding: "20px 8px" } },
-            titled ? createElement("h3", { style: { margin: 0, fontSize: 16, fontWeight: 600 } }, t("title")) : null,
+            titled && only === undefined ? createElement("h3", { style: { margin: 0, fontSize: 16, fontWeight: 600 } }, t("title")) : null,
             middle,
             createElement(
                 "div",
@@ -1106,6 +1128,13 @@ export function apply(ctx: ClientContext): void {
     ctx.slots.inject(
         "settings.section",
         () => ctx.slots.register({ name: "settings.section", id: "bili", order: 100, label: () => t("nav"), locale: NS }, panel(true)),
+    );
+    // #5001: a dedicated settings entry that opens straight on the evict page —
+    // the evict controls were buried under the bili panel's config tab, which
+    // is where nobody looks when they want to kill context.
+    ctx.slots.inject(
+        "settings.section",
+        () => ctx.slots.register({ name: "settings.section", id: "bili-evict", order: 101, label: () => (t("nav") === zhDict.nav ? "驱逐" : "Evict"), locale: NS }, panel(true, "evict", "evict")),
     );
     ctx.slots.inject(
         "plugins.bundle.config",

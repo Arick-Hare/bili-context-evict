@@ -384,6 +384,18 @@ export async function handleConfigPut(
                         : {}),
                 };
             }
+            // 正文守卫同理：设置页只提交它认识的三个开关，别把 textGuard 段里
+            // 以后新加的键整段覆盖掉（与 evict 段的深合并同型）。
+            const oldGuard = (oldRaw as Record<string, unknown>).textGuard;
+            const nextGuard = (next as Record<string, unknown>).textGuard;
+            if (oldGuard && typeof oldGuard === "object" && !Array.isArray(oldGuard)) {
+                merged.textGuard = {
+                    ...(oldGuard as Record<string, unknown>),
+                    ...(nextGuard && typeof nextGuard === "object" && !Array.isArray(nextGuard)
+                        ? (nextGuard as Record<string, unknown>)
+                        : {}),
+                };
+            }
             atomicWriteConfig(merged as ConfigShape);
             // 回读对比键集合：少了的键写日志报警（不静默）。
             const reread = readConfig();
