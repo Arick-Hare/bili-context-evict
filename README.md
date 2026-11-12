@@ -126,6 +126,29 @@ The proxy injects four context-management tools into the conversation; the model
 - **`search_context`** — keyword search over compressed summaries and visible messages.
 - **`acp_status`** — context-usage overview plus which ranges are still compressible.
 
+### How low can the water level actually go?
+
+Not to zero, and not to whatever you set. There is a **floor** per agent, and it depends on how much the agent injects every turn.
+
+What eviction can remove: sealed turns and summary blocks past the boundary. What it cannot remove:
+
+- **the system prompt / injected memory** — fixed by the host, every single request;
+- **the summary blocks themselves** — they can be merged into a colder tier, but a marker still stands in their place;
+- **the tool-result rounds you asked to keep** (`keepToolResultRounds`), plus whatever arrived after the last seal.
+
+So the floor is roughly:
+
+```
+floor ≈ (system prompt + live summaries + kept tool rounds + unsealed tail) / window size
+```
+
+Two consequences worth knowing before you tune `budget`:
+
+1. **`budget` is a target, not a guarantee.** Set it below the floor and eviction will run, evict nothing useful, and log that it did. That is not a bug.
+2. **The floor is not a property of this plugin — it is a property of your agent.** An agent that injects 260 KB of persona and memory every turn has a floor around 30–40% of a 1M window, whatever you configure. An agent that injects 8 KB has a much lower one.
+
+A useful way to read the number: it is the agent's **resting weight**. It floats up and down a little, but the skeleton (system prompt) cannot be dismantled and the flesh (conversation) is what you are actually trimming.
+
 ## Which do I need?
 
 Pick by your client:
