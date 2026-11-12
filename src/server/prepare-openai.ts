@@ -4,6 +4,7 @@ import { isRenderedSummaryMessage, renderNudgeText, viableRanges } from "acp-ker
 import { coreToOpenai, injectOpenaiSystem, openaiToCore, type BiliMessage, type OpenAIRequestBody, type OpenAITool } from "acp-kernel/wire";
 import type { CompressReasoningConfig } from "../reasoning-drop.js";
 import { resolveTextSanitize, guardCoreMessages, guardWireMessages } from "../text-sanitize.js";
+import { resolveWatermarkReminder, decideWatermarkReminder, appendSystemReminder, appendGoogleSystemInstruction } from "../watermark-reminder.js";
 import type { ProxyOptions } from "../config.js";
 import { effectivePromptCacheRouting } from "../config.js";
 import { currentCalibrationFactor, hardenOpenaiAssistantContent, systemToUser } from "../util.js";
@@ -528,6 +529,19 @@ export async function prepareOpenai(
     // 存盘（snapshotMessages(originalMessages)）与 content_hash 一字不动。
     guardWireMessages(rebuilt.messages, resolveTextSanitize(), log, sessionId);
     warnReasoningPairs(rebuiltMessages, log, sessionId);
+    // 水位提醒（2026-11-11）：上下文过线时往出站视图插一条 system 消息。
+    {
+        const wcfg = resolveWatermarkReminder();
+        if (wcfg.enabled) {
+            const wtext = decideWatermarkReminder({
+                sessionId,
+                ratio: (session.stats.contextTokens ?? tokenCount) / config.modelContextLimit,
+                cfg: wcfg,
+                log,
+            });
+            if (wtext) appendSystemReminder(rebuilt.messages, wtext);
+        }
+    }
     clampOutgoingOutput(rebuilt as Record<string, unknown>, typeof (parsed as Record<string, unknown>).max_completion_tokens === "number" ? "max_completion_tokens" : "max_tokens", { systemText: openaiSystemText, tools: toolsOut, processedMessages, lastInputTokens: session.stats.lastInputTokens, lastInputTokensSource: session.stats.lastInputTokensSource, nativeWindow, headroomWindow: config.modelContextLimit, imageTokens: imageReserveFor(session, "openai", rebuilt, opts, billingUpstream ?? upstreamOrigin), kFactor: currentCalibrationFactor(session.stats, session.metadata?.lastModel), kOrigin: session.stats.calibratedEstimateOrigin, origin: billingUpstream ?? upstreamOrigin, ledgerFloorTokens: dshLedgerFloorTokens(session.metadata), knownOutputCeiling: resolveKnownOutputCeiling(req.headers, parsed as Record<string, unknown>, opts.routes, billingUpstream ?? upstreamOrigin, opts.sessionHeader, modelIdOf(parsed)) }, sessionId, log, (c) => { session.stats.lastOutputClamp = { ...c, at: Date.now() }; });
     // prompt_cache_retention is an OpenAI-host-only cache directive; the dsh
     // launcher forces PI_CACHE_RETENTION=long (for the session-id

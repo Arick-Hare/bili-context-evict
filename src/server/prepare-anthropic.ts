@@ -6,6 +6,7 @@ import { rewriteInboundThreadContinue } from "./thread-tracking.js";
 import { captureThreadsTurn, estimateThreadsTokens, isThreadsBody, threadsReforgeEnabled } from "./threads-lane.js";
 import type { CompressReasoningConfig } from "../reasoning-drop.js";
 import { resolveTextSanitize, guardCoreMessages, guardWireMessages } from "../text-sanitize.js";
+import { resolveWatermarkReminder, decideWatermarkReminder, appendSystemReminder, appendGoogleSystemInstruction } from "../watermark-reminder.js";
 import type { ProxyOptions } from "../config.js";
 import { pluginAgentHeader } from "../plugin.js";
 import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, makeFoldPointReasoningDroppable, planReasoningDrop, reapOrphansLogged, runNudgeDecision, stripKernelSummaries, warnAnthropicThinkingPairs, type Prepared } from "../server.js";
@@ -624,6 +625,19 @@ export async function prepareAnthropic(
     // 存盘（snapshotMessages(originalMessages)）与 content_hash 一字不动。
     guardWireMessages(rebuilt.messages, resolveTextSanitize(), log, sessionId);
     warnAnthropicThinkingPairs(parsed.messages, rebuiltMessages, log, sessionId);
+    // 水位提醒（2026-11-11）：上下文过线时往出站视图插一条 system 消息。
+    {
+        const wcfg = resolveWatermarkReminder();
+        if (wcfg.enabled) {
+            const wtext = decideWatermarkReminder({
+                sessionId,
+                ratio: (session.stats.contextTokens ?? tokenCount) / config.modelContextLimit,
+                cfg: wcfg,
+                log,
+            });
+            if (wtext) appendSystemReminder(rebuilt.messages, wtext);
+        }
+    }
     // prompt_cache_key is the omp plugin's session id stamped for the proxy's
     // identity chain (#268), not part of the Anthropic Messages API — strip it
     // so the real upstream never sees a field it doesn't know.

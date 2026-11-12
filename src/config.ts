@@ -1920,6 +1920,19 @@ type FileConfig = {
         headChars?: number;
         cycleMinRepeats?: number;
     };
+    /**
+     * 水位提醒（2026-11-11）：上下文过线时往发给模型的请求里插一条 system
+     * 消息，提醒自己该走记忆整合流程。不是 QQ 消息、不是横幅，是进上下文的
+     * system 提示。只改 OUTBOUND VIEW。env 优先级更高：
+     * BILI_WATERMARK_ENABLED / BILI_WATERMARK_RATIO / BILI_WATERMARK_COOLDOWN /
+     * BILI_WATERMARK_TEXT。默认 enabled=true（非危险功能，只是插一句话）。
+     */
+    watermarkReminder?: {
+        enabled?: boolean;
+        ratio?: number;
+        cooldownMinutes?: number;
+        text?: string;
+    };
     /** Set `false` to log real (non-public) target hosts instead of the
      *  `<private-host>` placeholder (#897; env BILI_LOG_MASK_HOSTS=0 wins). */
     maskHosts?: boolean;

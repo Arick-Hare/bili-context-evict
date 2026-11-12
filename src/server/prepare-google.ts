@@ -4,6 +4,7 @@ import { renderNudgeText, viableRanges } from "acp-kernel";
 import { coreToGoogle, googleToCore, normalizeGoogleUserPartOrder, type BiliMessage, type GoogleContent, type GoogleRequestBody, type GoogleSystemInstruction, type GoogleTool } from "acp-kernel/wire";
 import type { ProxyOptions } from "../config.js";
 import { resolveTextSanitize, guardWireMessages } from "../text-sanitize.js";
+import { resolveWatermarkReminder, decideWatermarkReminder, appendSystemReminder, appendGoogleSystemInstruction } from "../watermark-reminder.js";
 import { pluginAgentHeader } from "../plugin.js";
 import { currentCalibrationFactor } from "../util.js";
 import { diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, makeFoldPointReasoningDroppable, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, usageGradeInputBaseline, type Prepared } from "../server.js";
@@ -394,6 +395,20 @@ export async function prepareGoogle(
     const rebuilt: GoogleRequestBody = { ...parsed, contents: rebuiltContents, tools: toolsOut, systemInstruction };
     // 正文三道闸：Google wire 的出站兜底（上一轮漏接，本次补齐；contents 用 parts）。
     guardWireMessages(rebuilt.contents, resolveTextSanitize(), log, sessionId);
+    // 水位提醒（2026-11-11）：上下文过线时往出站视图插一条 system 消息。
+    // Gemini 的 system 在 systemInstruction 而非 contents 里。
+    {
+        const wcfg = resolveWatermarkReminder();
+        if (wcfg.enabled) {
+            const wtext = decideWatermarkReminder({
+                sessionId,
+                ratio: (session.stats.contextTokens ?? tokenCount) / config.modelContextLimit,
+                cfg: wcfg,
+                log,
+            });
+            if (wtext) rebuilt.systemInstruction = appendGoogleSystemInstruction(rebuilt.systemInstruction, wtext);
+        }
+    }
     clampOutgoingOutput(rebuilt as Record<string, unknown>, "generationConfig.maxOutputTokens", { systemText: googleClientSystem, tools: toolsOut, processedMessages, lastInputTokens: session.stats.lastInputTokens, lastInputTokensSource: session.stats.lastInputTokensSource, nativeWindow, headroomWindow: config.modelContextLimit, imageTokens: imageReserveFor(session, "google", rebuilt, opts, upstreamOrigin), kFactor: currentCalibrationFactor(session.stats, session.metadata?.lastModel), kOrigin: session.stats.calibratedEstimateOrigin, origin: upstreamOrigin, ledgerFloorTokens: dshLedgerFloorTokens(session.metadata), knownOutputCeiling: resolveKnownOutputCeiling(req.headers, parsed as Record<string, unknown>, opts.routes, upstreamOrigin, opts.sessionHeader, model) }, sessionId, log, (c) => { session.stats.lastOutputClamp = { ...c, at: Date.now() }; });
     // #532: title-gen side requests carry their own tiny system — skip them.
     if (!isTitleGen && googleOutboundSystem !== undefined) {

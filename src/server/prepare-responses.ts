@@ -4,6 +4,7 @@ import { defaultCountTokens, renderNudgeText, viableRanges } from "acp-kernel";
 import { injectResponsesDeveloperMessage, type BiliMessage, type ResponseInputItem, type ResponsesProjection, type ResponsesRequestBody } from "acp-kernel/wire";
 import type { CompressReasoningConfig } from "../reasoning-drop.js";
 import { resolveTextSanitize, guardCoreMessages, guardWireMessages } from "../text-sanitize.js";
+import { resolveWatermarkReminder, decideWatermarkReminder, appendSystemReminder, appendGoogleSystemInstruction } from "../watermark-reminder.js";
 import { resolveAbsorbSettings } from "../compress-settings.js";
 import { effectivePromptCacheRouting, resolveCompressProtocol, type CompressSettings, type ProxyOptions } from "../config.js";
 import { currentCalibrationFactor, strippedResponseIdWarning } from "../util.js";
@@ -616,6 +617,19 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
     // 正文三道闸：Responses wire 的出站兜底（上一轮漏接，本次补齐）。
     guardWireMessages(rebuilt.input, resolveTextSanitize(), log, sessionId);
     warnResponsesReasoningPairs(Array.isArray(rebuiltInput) ? rebuiltInput : [], log, sessionId);
+    // 水位提醒（2026-11-11）：上下文过线时往出站视图插一条 system 消息。
+    {
+        const wcfg = resolveWatermarkReminder();
+        if (wcfg.enabled) {
+            const wtext = decideWatermarkReminder({
+                sessionId,
+                ratio: (session.stats.contextTokens ?? tokenCount) / config.modelContextLimit,
+                cfg: wcfg,
+                log,
+            });
+            if (wtext) appendSystemReminder(rebuilt.input, wtext);
+        }
+    }
     if (!isCompactionTrigger) {
         clampOutgoingOutput(rebuilt as Record<string, unknown>, "max_output_tokens", { systemText: (responsesProjection?.systemParts ?? []).join("\n"), tools: toolsOut, processedMessages, lastInputTokens: session.stats.lastInputTokens, lastInputTokensSource: session.stats.lastInputTokensSource, nativeWindow, headroomWindow: config.modelContextLimit, imageTokens: imageReserveFor(session, "responses", rebuilt, opts, billingUpstream ?? upstreamOrigin), kFactor: currentCalibrationFactor(session.stats, session.metadata?.lastModel), kOrigin: session.stats.calibratedEstimateOrigin, origin: billingUpstream ?? upstreamOrigin, ledgerFloorTokens: dshLedgerFloorTokens(session.metadata), knownOutputCeiling: resolveKnownOutputCeiling(req.headers, parsed as Record<string, unknown>, opts.routes, billingUpstream ?? upstreamOrigin, opts.sessionHeader, modelIdOf(parsed)) }, sessionId, log, (c) => { session.stats.lastOutputClamp = { ...c, at: Date.now() }; });
     }
