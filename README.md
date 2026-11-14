@@ -149,6 +149,20 @@ Two consequences worth knowing before you tune `budget`:
 
 A useful way to read the number: it is the agent's **resting weight**. It floats up and down a little, but the skeleton (system prompt) cannot be dismantled and the flesh (conversation) is what you are actually trimming.
 
+### Can eviction revive a session that is already full?
+
+No. Worth being blunt about this, because it is the most common thing people expect and it is the one thing this plugin does not do.
+
+Eviction is a **space-reclaiming** step, not a memory feature. It replaces sealed turns and already-summarised blocks with a one-line marker. It never touches raw, never-compressed conversation — folding is compression's job, and compression has to have happened **first**. So:
+
+1. **A session whose history has never been folded has nothing for eviction to remove.** No blocks, no candidates, `evictedCount: 0`. Running it on a full-but-uncompressed session does nothing, and logging "0" is not a failure.
+2. **A session that has been folded can be brought down** by replacing old blocks with markers. That buys room to keep working.
+3. **Neither case restores memory.** "Revived" here means *it can keep running*, not *the agent remembers what was in those blocks*. Without an external memory layer to recall from, that history is simply gone from the agent's perspective.
+
+The honest one-liner: **eviction buys time; it does not buy memory.**
+
+If you need an agent that survives crossing the limit with its continuity intact, give it a memory layer of its own — write summaries, keep a searchable store, recall on demand. That is deliberately outside this plugin's scope. An eviction pass that also decided what your agent gets to remember would be making that decision on your behalf, and it is the wrong component to hold that power.
+
 ## Which do I need?
 
 Pick by your client:
@@ -758,6 +772,25 @@ Client-side plugins for pi / omp / opencode ship inside `billion-context` (`dist
 This project is MIT-licensed **plus one additional term**: any product or service (commercial or open source) whose users can see or interact with it and which uses this software must attribute it — stating that it uses billion-context with a link back to this repository — on its home page, documentation, or About/Credits page. Pure server-side/embedded use satisfies this via shipped documentation. See the **Additional Term** at the end of [LICENSE](LICENSE).
 
 If you build on this project, we'd love to hear about it: open an issue (no obligation) so we can track where it's used.
+
+## 中文说明（本 fork）
+
+本仓库是从 [ranxianglei/billion-context](https://github.com/ranxianglei/billion-context) fork 出来的一个分支，**MIT 许可证与原作者署名保留**（见上方 License 与 Attribution requirement）。它不是上游原版，是为「小洄」这类长会话 agent 做的改造版。
+
+**它做什么**
+
+- **块级驱逐（block eviction）**：上下文超水位时，把已经由外部归档的旧对话回合、以及已经被压缩成摘要的块，整体换成一行 `[evicted: …]` 标记（原文仍留在 `index.db`，可回溯）。是否允许驱逐由 `sleep.json` 的「封盘线」决定——封盘线之后的内容一律不动，相当于给上下文一个不可逆的「到此为止」。
+- **三个默认全关的可选守卫**：出站净化（outbound sanitize）、短周期循环检测（cycle guard）、assistant 正文不进上下文（drop assistant text）。它们都默认关闭，按需打开。
+- **水位提醒（watermark reminder）**：上下文水位过线时，往发给模型的请求里插一条 system 提示，提醒「该整理归档了」。**这只是给模型的一句提示，插件本身不会替谁整理记忆，也不会替谁封盘**——是否行动由使用者决定。
+
+**怎么装**
+
+- 用 `file:` 直接指向本地仓库，或 `npm pack` 出的 `.tgz` 安装。**不要直接用 github 地址装**：仓库的 `dist/` 被 `.gitignore` 忽略，从 github 克隆/安装拿到的是没有编译产物的源码，跑不起来。
+- 装完**重启 dsh**（插件是预编译的，热重载不更新 dist）。
+
+**一条边界**
+
+同一个 profile 里**只能装一份**本插件，**不能和官方版 `billion-context` 并存**——两份会争抢同一份 `index.db` 与同一把封盘锁，行为未定义。
 
 ## License
 

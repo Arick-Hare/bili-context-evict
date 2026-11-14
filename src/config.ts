@@ -1932,6 +1932,9 @@ type FileConfig = {
         ratio?: number;
         cooldownMinutes?: number;
         text?: string;
+        /** 激活时段（小时，0–23）。默认 0/24 表示全天；from<=to 不跨午夜，from>to 跨午夜。 */
+        activeFromHour?: number;
+        activeToHour?: number;
     };
     /** Set `false` to log real (non-public) target hosts instead of the
      *  `<private-host>` placeholder (#897; env BILI_LOG_MASK_HOSTS=0 wins). */

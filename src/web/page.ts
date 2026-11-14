@@ -193,6 +193,24 @@ export function renderPage(origin: string, version: string, embed = false, theme
 </div>
 <p class="dim small" style="margin:0">三个开关和两个阈值随上面的「保存驱逐配置」一起写入，重启后保持。开源默认全关，不要替别人打开。</p>
 </div></div>
+<div class="card"><div class="card-h"><span>水位提醒（可选）</span></div><div class="card-b">
+<p class="dim small" style="margin:0 0 12px;line-height:1.8">上下文水位到阈值时，往发给模型的请求里夹一条「该做记忆整合了」的提醒（只进模型上下文，不弹窗、不发消息）。想只在白天推送、夜间静默，设下面的激活时段（本地小时）。开关、时段、间隔都在这里调，重启后保持。</p>
+<label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-bottom:10px"><input type="checkbox" id="wm-enabled"> <span>启用水位提醒</span></label>
+<div class="grid cols-2" style="gap:12px;margin-bottom:8px">
+<label style="display:flex;flex-direction:column;gap:6px;font-size:13px"><span>激活时段起（0–23 点）</span>
+<input type="number" id="wm-from" min="0" max="23" step="1" class="field-input" placeholder="0"></label>
+<label style="display:flex;flex-direction:column;gap:6px;font-size:13px"><span>激活时段止（0–24 点）</span>
+<input type="number" id="wm-to" min="0" max="24" step="1" class="field-input" placeholder="24"></label>
+</div>
+<p class="dim small" style="margin:0 0 12px">例：设 8 到 22 → 早 8 点到晚 10 点推送，其余时间静默。留空或 0–24 表示全天。</p>
+<label style="display:flex;flex-direction:column;gap:6px;font-size:13px;margin-bottom:8px"><span>冷却间隔（分钟，默认 60）</span>
+<input type="number" id="wm-cooldown" min="0" step="1" class="field-input" placeholder="60"></label>
+<label style="display:flex;flex-direction:column;gap:6px;font-size:13px;margin-bottom:8px"><span>水位线（0–1，默认 0.3，与驱逐独立）</span>
+<input type="number" id="wm-ratio" min="0.05" max="0.95" step="0.01" class="field-input" placeholder="0.3"></label>
+<label style="display:flex;flex-direction:column;gap:6px;font-size:13px;margin-bottom:8px"><span>提醒文案（{ratio} 替换为实际百分比）</span>
+<input type="text" id="wm-text" class="field-input" placeholder="上下文已到 {ratio}%。转告使用者：该整理归档了，但由使用者决定、不要自行改写记忆或封盘。"></label>
+<p class="dim small" style="margin:0">以上随本页「保存驱逐配置」按钮一起写入。</p>
+</div></div>
 </section>
 <section id="page-logs" class="page" hidden>
 <div class="page-head"><div><h1 data-i18n="logs.title">${zh("logs.title")}</h1><div class="sub" data-i18n="logs.sub">${zh("logs.sub")}</div></div></div>

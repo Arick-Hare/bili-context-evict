@@ -405,6 +405,7 @@ export async function prepareGoogle(
                 ratio: (session.stats.contextTokens ?? tokenCount) / config.modelContextLimit,
                 cfg: wcfg,
                 log,
+                messages: rebuilt.contents,
             });
             if (wtext) rebuilt.systemInstruction = appendGoogleSystemInstruction(rebuilt.systemInstruction, wtext);
         }

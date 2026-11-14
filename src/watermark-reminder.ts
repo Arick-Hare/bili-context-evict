@@ -24,6 +24,10 @@ export interface WatermarkReminderConfig {
     cooldownMinutes: number;
     /** 提醒文案，`{ratio}` 会被替换成实际百分比（如 43.7）。 */
     text: string;
+    /** 激活时段起点（小时 0–23）。默认 0。 */
+    activeFromHour: number;
+    /** 激活时段终点（小时 0–24，24 表示午夜）。默认 24（全天）。 */
+    activeToHour: number;
 }
 
 export interface WatermarkReminderFileConfig {
@@ -31,6 +35,8 @@ export interface WatermarkReminderFileConfig {
     ratio?: number;
     cooldownMinutes?: number;
     text?: string;
+    activeFromHour?: number;
+    activeToHour?: number;
 }
 
 /** 默认：开、30% 阈值、60 分钟冷却、固定前缀 + 文案。 */
@@ -38,7 +44,9 @@ export const DEFAULT_WATERMARK_REMINDER: WatermarkReminderConfig = {
     enabled: true,
     ratio: 0.3,
     cooldownMinutes: 60,
-    text: "上下文已到 {ratio}%，手头这件事做完去做一遍记忆整合流程。",
+    activeFromHour: 0,
+    activeToHour: 24,
+    text: "上下文已到 {ratio}%。把这条提示转告给使用者。如果你们已经约好整理与封盘的方式，就按约定做；还没约好，先把方式定下来，不要自行改写记忆、不要自行封盘。",
 };
 
 /** 固定前缀，方便模型一眼认出这是水位提醒而非用户/系统噪声。 */
@@ -83,6 +91,8 @@ export function resolveWatermarkReminder(
         ratio: numConfig(env.BILI_WATERMARK_RATIO, f?.ratio, DEFAULT_WATERMARK_REMINDER.ratio),
         cooldownMinutes: numConfig(env.BILI_WATERMARK_COOLDOWN, f?.cooldownMinutes, DEFAULT_WATERMARK_REMINDER.cooldownMinutes),
         text: env.BILI_WATERMARK_TEXT ?? f?.text ?? DEFAULT_WATERMARK_REMINDER.text,
+        activeFromHour: numConfig(env.BILI_WATERMARK_FROM, f?.activeFromHour, DEFAULT_WATERMARK_REMINDER.activeFromHour),
+        activeToHour: numConfig(env.BILI_WATERMARK_TO, f?.activeToHour, DEFAULT_WATERMARK_REMINDER.activeToHour),
     };
 }
 
@@ -101,6 +111,66 @@ export function clearWatermarkReminderState(sessionId?: string): void {
     else states.delete(sessionId);
 }
 
+// ── 用户状态判断（按需派活）──────────────────────────────────────────────
+// 空转诱因之一是「无差别派活」：用户已说去睡/说完了，仍每 60 分钟塞一条
+// 「去做记忆整合」。这里识别最后一条 user 消息是否含结束/离开语义，命中则
+// 让 decide 抑制派活（详见 decide 内注释）。
+
+/** 结束/离开语义关键词（中英文，大小写不敏感）。覆盖小洄文档触发条件：
+ *  她已经说要去睡、说完了、没有问句了、我该收工了。 */
+export const USER_ENDING_RE =
+    /(睡觉|去睡|睡了|睡觉了|晚安|休息|bye|good\s?bye|good\s?night|结束|说完了|收工|下播|不说了|先撤|先不|回见|see\s?you|先停|你停|停一下|停手)/i;
+
+/** 从一条消息的 content 抽纯文本（兼容 string / 文本块数组 / responses input_text）。 */
+function messageText(content: unknown): string {
+    if (typeof content === "string") return content;
+    if (Array.isArray(content)) {
+        return content
+            .map((p) => {
+                if (typeof p === "string") return p;
+                if (p && typeof p === "object") {
+                    const o = p as Record<string, unknown>;
+                    if (typeof o.text === "string") return o.text;
+                    if (typeof o.value === "string") return o.value;
+                }
+                return "";
+            })
+            .join(" ");
+    }
+    if (content && typeof content === "object") {
+        const o = content as Record<string, unknown>;
+        if (typeof o.text === "string") return o.text;
+        if (Array.isArray(o.content)) return messageText(o.content);
+    }
+    return "";
+}
+
+/** 提取最后一条 user 消息的纯文本（任意协议形状：openai/anthropic 的 messages、
+ *  responses 的 input、google 的 contents 都是 role-based 数组）。无则 null。 */
+export function extractLastUserText(messages: unknown): string | null {
+    if (!Array.isArray(messages)) return null;
+    let last: string | null = null;
+    for (const m of messages as Array<unknown>) {
+        if (!m || typeof m !== "object") continue;
+        const o = m as Record<string, unknown>;
+        const role = typeof o.role === "string" ? o.role : typeof o.type === "string" ? o.type : "";
+        if (role === "user") {
+            const t = messageText(o.content ?? o.input ?? o.parts);
+            if (t) last = t;
+        }
+    }
+    return last;
+}
+
+/** 当前小时是否落在激活时段内。from<=to 不跨午夜（如 8–22 表示早8到晚10）；
+ *  from>to 跨午夜（如 22–8 表示晚10到早8）。默认 0–24 全天。 */
+function inActiveWindow(cfg: WatermarkReminderConfig, now: number): boolean {
+    const h = new Date(now).getHours();
+    const { activeFromHour: from, activeToHour: to } = cfg;
+    if (from <= to) return h >= from && h < to;
+    return h >= from || h < to;
+}
+
 // ── 决策（纯逻辑，可单测）─────────────────────────────────────────────────
 
 /**
@@ -117,12 +187,24 @@ export function decideWatermarkReminder(opts: {
     cfg: WatermarkReminderConfig;
     /** 与 prepare 的 ctx.log 一致：(level, msg)。内部会包成单参 logger。 */
     log?: (level: string, msg: string) => void;
+    /** 原始出站 messages（任意协议形状），用于提取最后一条 user 消息判断用户是否已结束/离开。 */
+    messages?: unknown;
+    /** 显式传入的最后 user 文本（优先于 messages 提取；便于测试）。 */
+    lastUserText?: string | null;
 }): string | null {
     // 适配：把两参 log 包成单参 logger，避免调用处漏传 level（2026-11-11 崩溃修复）
     const logger = opts.log
         ? (m: string) => { try { opts.log!("info", m); } catch {} }
         : undefined;
     if (!opts.cfg.enabled) return null; // 总开关关 → 绝不插入（验收第 4 条）
+    // 按需派活：用户已结束/离开对话（最后一条 user 消息含结束/离开语义）
+    // 时不派活——她去睡了/说完了，不该再塞「去做记忆整合」的活，那是空转诱因。
+    // 用户活跃回来后，最后 user 不再是结束词，自动恢复派活（冷却逻辑照常）。
+    const lastUser = opts.lastUserText !== undefined ? opts.lastUserText : extractLastUserText(opts.messages);
+    if (lastUser && USER_ENDING_RE.test(lastUser)) {
+        logger?.(`[watermark] 最后一条 user 消息含结束/离开语义，抑制派活（不注入提醒）`);
+        return null;
+    }
     const now = opts.now ?? Date.now();
     const st = states.get(opts.sessionId) ?? { lastRemindedAt: null };
 
@@ -142,6 +224,12 @@ export function decideWatermarkReminder(opts: {
         return null;
     }
 
+    // 规则 1b：激活时段（夜间不推送）。不在时段不注入，且不消耗冷却——
+    // 夜间静默，早上到时段自动恢复（lastRemindedAt 不更新）。
+    if (!inActiveWindow(opts.cfg, now)) {
+        logger?.(`[watermark] 当前不在激活时段（${opts.cfg.activeFromHour}:00–${opts.cfg.activeToHour}:00），抑制派活`);
+        return null;
+    }
     // 规则 1：过线且不在冷却 → 提醒一次
     st.lastRemindedAt = now;
     states.set(opts.sessionId, st);

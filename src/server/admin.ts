@@ -348,7 +348,7 @@ async function handleEvictNow(
                 session.state,
                 previewBoundarySeq(base, evict, db),
                 new Set<string>(),
-                Math.max(1, Math.floor(evict.minToolResultChars ?? 200)),
+                Math.max(1, Math.floor(evict.minBlockSummaryChars ?? 1)),
                 {
                     spans: db.available ? db.blockSpans(base) : null,
                     messageSeqByRef: db.available ? db.messageSeqByRef(base) : null,

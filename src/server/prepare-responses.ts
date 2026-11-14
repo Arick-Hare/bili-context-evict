@@ -626,6 +626,7 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
                 ratio: (session.stats.contextTokens ?? tokenCount) / config.modelContextLimit,
                 cfg: wcfg,
                 log,
+                messages: rebuilt.input,
             });
             if (wtext) appendSystemReminder(rebuilt.input, wtext);
         }

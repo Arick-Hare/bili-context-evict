@@ -5253,6 +5253,12 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             const tgCycle = $("tg-cycle-guard");
             const tgMaxChars = $("tg-max-chars");
             const tgCycleRepeats = $("tg-cycle-repeats");
+            const wmEnabled = $("wm-enabled");
+            const wmFrom = $("wm-from");
+            const wmTo = $("wm-to");
+            const wmCooldown = $("wm-cooldown");
+            const wmRatio = $("wm-ratio");
+            const wmText = $("wm-text");
             const sessionList = $("evict-session-list");
             const selectAllBtn = $("evict-select-all");
             const selectNoneBtn = $("evict-select-none");
@@ -5387,6 +5393,26 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
                 }
             }
 
+            // 水位提醒：从 raw config 读 watermarkReminder 段填入控件。默认开。
+            async function loadWatermark() {
+                try {
+                    const cfg = await json(API_ROOT + "/config");
+                    const raw = typeof cfg.raw === "string" && cfg.raw.trim() ? cfg.raw : "{}";
+                    let obj = {};
+                    try { obj = JSON.parse(raw); } catch { obj = {}; }
+                    const wm = obj && typeof obj === "object" && obj.watermarkReminder && typeof obj.watermarkReminder === "object" && !Array.isArray(obj.watermarkReminder)
+                        ? obj.watermarkReminder : {};
+                    if (wmEnabled) wmEnabled.checked = wm.enabled === true;
+                    if (wmFrom) wmFrom.value = typeof wm.activeFromHour === "number" ? String(wm.activeFromHour) : "";
+                    if (wmTo) wmTo.value = typeof wm.activeToHour === "number" ? String(wm.activeToHour) : "";
+                    if (wmCooldown) wmCooldown.value = typeof wm.cooldownMinutes === "number" ? String(wm.cooldownMinutes) : "";
+                    if (wmRatio) wmRatio.value = typeof wm.ratio === "number" ? String(wm.ratio) : "";
+                    if (wmText) wmText.value = typeof wm.text === "string" ? wm.text : "";
+                } catch (e) {
+                    if (saveNote) saveNote.textContent = "读取水位提醒配置失败：" + e.message;
+                }
+            }
+
             // 4.4 深合并：读整份 raw → 只改 evict / textGuard 两个段 → 用
             // whole-file PUT 写回。服务端 handleConfigPut 也会把未知键深合并回来。
             async function saveEvictConfig() {
@@ -5405,7 +5431,12 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
                     if (Number.isFinite(target) && !(target > 0 && target < 1)) throw new Error("target 要在 0 和 1 之间");
                     const picked = checkedSessions();
                     const allIds = Array.from(document.querySelectorAll(".evict-session-check")).map((el) => el.value);
-                    const sessions = picked.length > 0 && picked.length === allIds.length ? ["*"] : picked;
+                    // 会话列表尚未加载完（allIds 为空）时，不覆盖原配置的 sessions，
+                    // 否则会误写成空数组，把「生效会话」清空 → 驱逐与工具裁剪一起停掉。
+                    const listLoaded = allIds.length > 0;
+                    const sessions = listLoaded
+                        ? (picked.length > 0 && picked.length === allIds.length ? ["*"] : picked)
+                        : undefined;
                     obj.evict = {
                         ...oldEvict,
                         ...(Number.isFinite(budget) ? { budget } : {}),
@@ -5413,7 +5444,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
                         dryRun: dryRunBox ? dryRunBox.checked : false,
                         boundaryFromSleep: fromSleep ? fromSleep.checked : true,
                         seqRefCheck: seqCheck ? seqCheck.value : "strict",
-                        sessions,
+                        ...(sessions !== undefined ? { sessions } : {}),
                     };
                     const oldTg = obj.textGuard && typeof obj.textGuard === "object" && !Array.isArray(obj.textGuard) ? obj.textGuard : {};
                     const maxChars = tgMaxChars ? Number(tgMaxChars.value) : NaN;
@@ -5428,8 +5459,26 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
                         ...(Number.isFinite(maxChars) && maxChars >= 100 ? { maxChars: Math.floor(maxChars) } : {}),
                         ...(Number.isFinite(cycleRepeats) && cycleRepeats >= 2 ? { cycleMinRepeats: Math.floor(cycleRepeats) } : {}),
                     };
+                    const oldWm = obj.watermarkReminder && typeof obj.watermarkReminder === "object" && !Array.isArray(obj.watermarkReminder) ? obj.watermarkReminder : {};
+                    const wmFromV = wmFrom ? Number(wmFrom.value) : NaN;
+                    const wmToV = wmTo ? Number(wmTo.value) : NaN;
+                    const wmCooldownV = wmCooldown ? Number(wmCooldown.value) : NaN;
+                    const wmRatioV = wmRatio ? Number(wmRatio.value) : NaN;
+                    if (wmFrom && wmFrom.value.trim() && !(Number.isFinite(wmFromV) && wmFromV >= 0 && wmFromV <= 23)) throw new Error("激活时段起要在 0–23");
+                    if (wmTo && wmTo.value.trim() && !(Number.isFinite(wmToV) && wmToV >= 0 && wmToV <= 24)) throw new Error("激活时段止要在 0–24");
+                    if (wmCooldown && wmCooldown.value.trim() && !(Number.isFinite(wmCooldownV) && wmCooldownV >= 0)) throw new Error("冷却间隔要不小于 0");
+                    if (wmRatio && wmRatio.value.trim() && !(Number.isFinite(wmRatioV) && wmRatioV > 0 && wmRatioV < 1)) throw new Error("水位线要在 0 和 1 之间");
+                    obj.watermarkReminder = {
+                        ...oldWm,
+                        enabled: wmEnabled ? wmEnabled.checked : true,
+                        ...(Number.isFinite(wmFromV) ? { activeFromHour: Math.floor(wmFromV) } : {}),
+                        ...(Number.isFinite(wmToV) ? { activeToHour: Math.floor(wmToV) } : {}),
+                        ...(Number.isFinite(wmCooldownV) ? { cooldownMinutes: Math.floor(wmCooldownV) } : {}),
+                        ...(Number.isFinite(wmRatioV) ? { ratio: wmRatioV } : {}),
+                        ...(wmText && wmText.value.trim() ? { text: wmText.value.trim() } : {}),
+                    };
                     await json(API_ROOT + "/config", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ file: JSON.stringify(obj, null, 2) }) });
-                    if (saveNote) saveNote.textContent = "已保存（深合并，其余键原样保留）";
+                    if (saveNote) saveNote.textContent = listLoaded ? "已保存（深合并，其余键原样保留）" : "已保存（会话列表未加载，未改动「生效会话」设置）";
                     loadConfig();
                     refreshStatus();
                     loadTextGuard();
@@ -5449,6 +5498,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             if (saveBtn) saveBtn.addEventListener("click", saveEvictConfig);
             refreshStatus();
             loadTextGuard();
+            loadWatermark();
         })();
         document.addEventListener("click", (ev) => {
             const target = ev.target;

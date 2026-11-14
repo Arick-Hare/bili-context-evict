@@ -43,6 +43,8 @@ export interface EvictFileSettings {
   dropToolResults?: boolean;
   keepToolResultRounds?: number;
   minToolResultChars?: number;
+  /** 块摘要短于此字符数不值得驱逐（换成标记反而更长）。默认 1 = 几乎都参与，精确门槛由 swapBlockSummary 的标记长度兜底。 */
+  minBlockSummaryChars?: number;
   persistCheck?: string;
   requirePersisted?: boolean;
   persistThreshold?: number;
@@ -86,6 +88,7 @@ export function parseEvictSettings(obj: unknown): EvictFileSettings | undefined 
   if (typeof o.dropToolResults === "boolean") out.dropToolResults = o.dropToolResults;
   if (typeof o.keepToolResultRounds === "number" && o.keepToolResultRounds >= 0) out.keepToolResultRounds = Math.floor(o.keepToolResultRounds);
   if (typeof o.minToolResultChars === "number" && o.minToolResultChars > 0) out.minToolResultChars = Math.floor(o.minToolResultChars);
+  if (typeof o.minBlockSummaryChars === "number" && o.minBlockSummaryChars >= 0) out.minBlockSummaryChars = Math.floor(o.minBlockSummaryChars);
   if (typeof o.requirePersisted === "boolean") out.requirePersisted = o.requirePersisted;
   if (typeof o.persistThreshold === "number" && o.persistThreshold > 0) out.persistThreshold = Math.floor(o.persistThreshold);
   if (typeof o.dryRun === "boolean") out.dryRun = o.dryRun;
@@ -167,6 +170,8 @@ export interface EvictConfig {
   keepToolResultRounds: number;
   /** 小于这个字符数的工具结果不值得丢。 */
   minToolResultChars: number;
+  /** 小于这个字符数的块摘要不值得驱逐（换成标记反而更长）。 */
+  minBlockSummaryChars: number;
   /** 截断位记录文件覆盖（默认 `<stateDir>/trim.json`，走 XDG）。 */
   trimFile?: string;
   /** 会话白名单：驱逐只对这些 sessionId 生效（空 = 不驱逐任何会话）。 */
@@ -205,6 +210,7 @@ export const DEFAULT_EVICT_CONFIG: EvictConfig = {
   dropToolResults: true,
   keepToolResultRounds: 6,
   minToolResultChars: 200,
+  minBlockSummaryChars: 1,
   boundaryFromSleep: true,
   seqRefCheck: "strict",
   refMismatchAllow: [],
@@ -361,6 +367,10 @@ export function resolveEvictConfig(
       fileEvict?.minToolResultChars,
       DEFAULT_EVICT_CONFIG.minToolResultChars,
     ),
+    minBlockSummaryChars:
+      typeof fileEvict?.minBlockSummaryChars === "number" && fileEvict.minBlockSummaryChars >= 0
+        ? Math.floor(fileEvict.minBlockSummaryChars)
+        : DEFAULT_EVICT_CONFIG.minBlockSummaryChars,
     trimFile: env.EVICT_TRIM_FILE ?? fileEvict?.trimFile,
     sessions: fileSessions,
     boundaryFromSleep: pickBool(
@@ -1304,7 +1314,7 @@ export function maybeEvict(
     state,
     boundarySeq,
     blockProtectedIds,
-    Math.max(1, Math.floor(evict.minToolResultChars ?? 200)),
+    Math.max(1, Math.floor(evict.minBlockSummaryChars ?? 1)),
     {
       spans: sessionId ? db.blockSpans(sessionId) : null,
       messageSeqByRef: sessionId ? db.messageSeqByRef(sessionId) : null,

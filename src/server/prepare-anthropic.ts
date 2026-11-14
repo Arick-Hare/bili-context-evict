@@ -634,6 +634,7 @@ export async function prepareAnthropic(
                 ratio: (session.stats.contextTokens ?? tokenCount) / config.modelContextLimit,
                 cfg: wcfg,
                 log,
+                messages: rebuilt.messages,
             });
             if (wtext) appendSystemReminder(rebuilt.messages, wtext);
         }

@@ -83,3 +83,66 @@ test("崩溃回归（2026-11-11）：传入两参 log（模拟 ctx.log 签名）
     assert.ok(lastMsg !== undefined, "log 必须收到非 undefined 的 msg");
     assert.ok(lastMsg!.includes("[watermark]"), "应打印水位日志");
 });
+
+test("按需派活（2026-11-12）：最后 user 消息含结束/离开语义 → 抑制派活", () => {
+    clearWatermarkReminderState();
+    for (const u of ["那我去睡了，晚安", "说完了，先撤", "good night，明天见", "我该收工了"]) {
+        const text = decideWatermarkReminder({ sessionId: "ended", ratio: 0.5, now: 1000, cfg: base, lastUserText: u, log: () => {} });
+        assert.equal(text, null, `「${u}」应抑制派活`);
+    }
+});
+
+test("按需派活（2026-11-12）：用户活跃（最后 user 无结束语义）→ 仍正常注入", () => {
+    clearWatermarkReminderState();
+    const text = decideWatermarkReminder({ sessionId: "active", ratio: 0.5, now: 1000, cfg: base, lastUserText: "帮我看下这个文件怎么改", log: () => {} });
+    assert.ok(text !== null, "活跃用户应正常提醒");
+});
+
+test("按需派活：从 messages 数组提取最后 user 文本（openai 形状）也能抑制", () => {
+    clearWatermarkReminderState();
+    const text = decideWatermarkReminder({
+        sessionId: "arr", ratio: 0.5, now: 1000, cfg: base, log: () => {},
+        messages: [
+            { role: "user", content: "在吗" },
+            { role: "assistant", content: "在" },
+            { role: "user", content: "我困了，去睡了晚安" },
+        ],
+    });
+    assert.equal(text, null, "最后 user 含晚安应抑制");
+});
+
+test("时间区间（2026-11-12）：激活 8–22，当前 23:00 不在时段 → 抑制派活", () => {
+    clearWatermarkReminderState();
+    const text = decideWatermarkReminder({
+        sessionId: "night", ratio: 0.5, now: new Date(2026, 0, 1, 23, 0, 0).getTime(),
+        cfg: { ...base, activeFromHour: 8, activeToHour: 22 }, log: () => {},
+    });
+    assert.equal(text, null, "夜间应抑制派活");
+});
+
+test("时间区间：激活 8–22，当前 10:00 在时段内 → 正常注入", () => {
+    clearWatermarkReminderState();
+    const text = decideWatermarkReminder({
+        sessionId: "day", ratio: 0.5, now: new Date(2026, 0, 1, 10, 0, 0).getTime(),
+        cfg: { ...base, activeFromHour: 8, activeToHour: 22 }, log: () => {},
+    });
+    assert.ok(text !== null, "白天应正常注入");
+});
+
+test("时间区间：默认 0–24 全天，凌晨 3:00 仍正常注入（不回归）", () => {
+    clearWatermarkReminderState();
+    const text = decideWatermarkReminder({
+        sessionId: "all", ratio: 0.5, now: new Date(2026, 0, 1, 3, 0, 0).getTime(),
+        cfg: base, log: () => {},
+    });
+    assert.ok(text !== null, "全天默认应保持原行为");
+});
+
+test("时间区间：跨午夜 22–8（晚10到早8激活），14:00 不在时段 → 抑制", () => {
+    clearWatermarkReminderState();
+    const text = decideWatermarkReminder({
+        sessionId: "cross", ratio: 0.5, now: new Date(2026, 0, 1, 14, 0, 0).getTime(),
+        cfg: { ...base, activeFromHour: 22, activeToHour: 8 }, log: () => {},
+    });
+    assert.equal(text, null, "白天（非激活）应抑制");
+});
