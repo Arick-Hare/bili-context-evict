@@ -26,7 +26,7 @@ test("1. 过线提醒：ratio 过阈值 → 返回带 [水位提醒] 的文本",
     assert.ok(text !== null, "应提醒");
     assert.ok(text!.includes("[水位提醒]"), "应有固定前缀");
     assert.ok(text!.includes("50.0%"), "应含实际百分比");
-    assert.ok(text!.includes("记忆整合流程"), "应含文案");
+    assert.ok(text!.includes("转告给使用者"), "应含中性文案（转告给使用者）");
 });
 
 test("2. 冷却内不提醒：同一 session 紧接着再 decide → null", () => {
