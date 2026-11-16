@@ -163,15 +163,47 @@ QQ群:
 
 ## 安装
 
-Linux / macOS —— 指定用户级 prefix 安装(全程不需要 `sudo`，也不改你的 npm 配置，`bili` 自更新不会再遇到权限问题)：
+本 fork 已发布到 npm，包名 **`bili-context-evict`**。包里带构建好的 `dist/`(44 个文件，tarball 约 11 MB)，正常安装**不需要**在本地构建。
+
+### 作为 DSH bundle 安装(推荐)
+
+装到你实际使用的 profile，然后重启 DSH：
 
 ```bash
-npm install -g billion-context --prefix=~/.local
+dsh plugin --profile web add bili-context-evict
+# 重启 DSH；块级驱逐默认关闭，要配了才跑
 ```
 
-`bili` 命令装在 `~/.local/bin`——多数发行版默认已在 PATH 中；没有的话把 `export PATH="$HOME/.local/bin:$PATH"` 写进 `~/.bashrc` 或 `~/.zshrc`。用 nvm 或 Homebrew Node 的，默认 prefix 本来就属于当前用户，直接 `npm install -g billion-context` 即可；Windows 的默认 prefix(`%APPDATA%\npm`)同样用户可写，直接 `npm install -g billion-context`。
+一个 profile 只能装一份。之前装过上游包的，先卸掉：
 
-这会安装 `bili` 命令(`bili-proxy` 保留为别名)。旧装的是 root 属主的 prefix、现在报 `EACCES`?用 `--prefix=~/.local` 重装即可根治(以后用 npm 重装 `bili` 时记得同样带上该参数)——不要用 `sudo`。
+```bash
+dsh plugin --profile web remove billion-context
+dsh plugin --profile web add bili-context-evict
+```
+
+### 作为独立 CLI
+
+```bash
+npm install -g bili-context-evict   # 装出 `bili-evict`(别名 `bili-evict-proxy`)
+bili-evict start --host 127.0.0.1 --port 18788
+```
+
+Linux / macOS 上如果旧前缀是 root 属主导致 `EACCES`，用 `--prefix=~/.local` 重装、不要用 `sudo`(记得把 `~/.local/bin` 加进 PATH)。Windows 的默认 prefix(`%APPDATA%\npm`)本来就是当前用户可写，直接全局安装即可。
+
+### 从源码安装(开发)
+
+```bash
+git clone https://github.com/Arick-Hare/bili-context-evict
+cd bili-context-evict
+npm ci
+npm run build
+npm pack                       # 产出 bili-context-evict-<version>.tgz
+dsh plugin --profile web add file:bili-context-evict-<version>.tgz
+```
+
+跳过 `npm ci && npm run build` 就没有 `dist/`(它被 gitignore 了)，DSH 会加载失败——直接从 git 检出装的时候最容易踩这个坑。
+
+配置(包括块级驱逐)见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md)；块级驱逐默认关闭。
 
 想用容器?仓库根目录自带 `Dockerfile`——见下文[在 Docker 中运行](#在-docker-中运行)。
 
