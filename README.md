@@ -197,23 +197,56 @@ Pick by your client:
 
 ## Install
 
-Linux / macOS — install with a user-level prefix (no `sudo`, no npm config
-changes, and `bili`'s self-update never hits permission errors):
+This fork is published on npm as **`bili-context-evict`**. It ships its built
+`dist/` (44 files, ~11 MB tarball), so a normal install needs no local build
+step.
+
+### As a DSH bundle (recommended)
+
+Target the profile you actually use, then restart DSH:
 
 ```bash
-npm install -g billion-context --prefix=~/.local
+dsh plugin --profile web add bili-context-evict
+# restart DSH; the block-level eviction defaults to OFF until you configure it
 ```
 
-The `bili` command lands in `~/.local/bin` — already on PATH in most distros;
-if not, add `export PATH="$HOME/.local/bin:$PATH"` to `~/.bashrc` or
-`~/.zshrc`. On nvm or Homebrew Node the default prefix is already user-owned —
-a plain `npm install -g billion-context` works as-is. On Windows the default
-prefix (`%APPDATA%\npm`) is also user-writable — plain `npm install -g billion-context`.
+A profile may hold only one copy — if you previously installed the upstream
+package, remove it first:
 
-This installs the `bili` command (`bili-proxy` is kept as an alias). Hitting
-`EACCES` with an old root-owned prefix? Reinstall with `--prefix=~/.local`
-(pass the flag again on any future npm reinstall of `bili`) — that is the
-permanent fix; avoid `sudo`.
+```bash
+dsh plugin --profile web remove billion-context
+dsh plugin --profile web add bili-context-evict
+```
+
+### As a standalone CLI
+
+```bash
+npm install -g bili-context-evict   # installs `bili-evict` (alias `bili-evict-proxy`)
+bili-evict start --host 127.0.0.1 --port 18788
+```
+
+On Linux / macOS with an old root-owned prefix, use
+`--prefix=~/.local` instead of `sudo` (then make sure `~/.local/bin` is on
+PATH). On Windows the default prefix (`%APPDATA%\npm`) is already user-writable.
+
+### From source (development)
+
+```bash
+git clone https://github.com/Arick-Hare/bili-context-evict
+cd bili-context-evict
+npm ci
+npm run build
+npm pack                       # produces bili-context-evict-<version>.tgz
+dsh plugin --profile web add file:bili-context-evict-<version>.tgz
+```
+
+Without `npm ci && npm run build` the package has no `dist/` (it is
+gitignored), and DSH will fail to load the bundle — this is the most common
+install failure when installing straight from the Git checkout.
+
+Configuration (including block-level eviction) lives in
+[CONFIGURATION.md](CONFIGURATION.md); block-level eviction is opt-in and off by
+default.
 
 Prefer containers? A `Dockerfile` ships at the repository root — see
 [Running in Docker](#running-in-docker) below.
